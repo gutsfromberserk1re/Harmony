@@ -1,0 +1,26 @@
+[package]
+name = "harmony"
+version = "1.0.0"
+description = "Harmony - YouTube playlist audio player"
+authors = ["Kiyo Kumo Ltd."]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "time", "sync", "net"] }
+window-vibrancy = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
