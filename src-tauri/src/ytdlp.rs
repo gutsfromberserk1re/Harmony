@@ -23,6 +23,8 @@ use crate::store;
 const COOKIES_BROWSER: &str = "";
 /// If YouTube shows its bot check, these browsers are tried in order for a signed-in session.
 const AUTO_COOKIE_BROWSERS: [&str; 4] = ["firefox", "chrome", "edge", "brave"];
+/// YouTube app "clients" that often work without a sign-in. Which ones do changes over time.
+const CLIENT_FALLBACKS: [&str; 3] = ["android_vr", "tv", "web_safari"];
 const AUTO_COOKIE_COOLDOWN: Duration = Duration::from_secs(600);
 const UPDATE_INTERVAL: Duration = Duration::from_secs(12 * 3600);
 
@@ -34,13 +36,23 @@ static STREAM_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static UPDATE_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static EXE: OnceLock<PathBuf> = OnceLock::new();
 
-struct CookieState {
-    browser: Option<&'static str>,
-    failed_at: Option<Instant>,
+/// Ways of reaching YouTube, tried in this order until one returns something:
+/// plain, alternate player clients (no sign-in), the imported cookies.txt, browser cookies.
+#[derive(Clone, Copy, PartialEq)]
+enum Strategy {
+    Default,
+    Client(&'static str),
+    CookieFile,
+    Browser(&'static str),
 }
-static COOKIES: Mutex<CookieState> = Mutex::new(CookieState {
-    browser: None,
-    failed_at: None,
+
+struct Memory {
+    good: Option<Strategy>, // what worked last time: tried first from then on
+    browsers_failed_at: Option<Instant>,
+}
+static MEMORY: Mutex<Memory> = Mutex::new(Memory {
+    good: None,
+    browsers_failed_at: None,
 });
 
 #[derive(Serialize)]
@@ -103,6 +115,14 @@ fn command(args: &[String]) -> Command {
         .kill_on_drop(true)
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8");
+    // yt-dlp looks for a JavaScript runtime (the bundled deno.exe) on PATH.
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        let mut paths = vec![dir];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     cmd
@@ -121,7 +141,7 @@ pub async fn prepare_and_update() {
     }
 
     let _guard = UPDATE_LOCK.lock().await;
-    let args = vec!["-U".to_string(), "--no-warnings".to_string()];
+    let args: Vec<String> = ["--update-to", "nightly", "--no-warnings"].map(String::from).to_vec();
     let mut cmd = command(&args);
     match timeout(Duration::from_secs(30), cmd.output()).await {
         Ok(Ok(out)) if out.status.success() => {
@@ -172,62 +192,172 @@ fn error_line(stderr: &str) -> String {
         .to_string()
 }
 
-/// cookies.txt next to the app (or in the data folder) wins, then the manual browser override.
-fn explicit_cookie_args() -> Vec<String> {
+fn cookie_file() -> PathBuf {
+    store::data_dir().join("cookies.txt")
+}
+
+#[tauri::command]
+pub fn cookies_status() -> bool {
+    cookie_file().exists()
+}
+
+/// Accepts only a YouTube/Google Netscape-format cookies file and makes sure it has the header
+/// line yt-dlp insists on.
+fn normalize_cookies(text: &str) -> Result<String, String> {
+    let text = text.trim_start_matches('\u{feff}');
+    let looks_ok = text.lines().any(|l| {
+        l.split('\t').count() >= 7 && (l.contains("youtube.com") || l.contains("google.com"))
+    });
+    if !looks_ok {
+        return Err("That doesn't look like a YouTube cookies.txt (Netscape format).".into());
+    }
+    let has_header = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map_or(false, |l| l.starts_with("# Netscape") || l.starts_with("# HTTP"));
+    Ok(if has_header {
+        text.to_string()
+    } else {
+        format!("# Netscape HTTP Cookie File\n{text}")
+    })
+}
+
+/// Stores a cookies.txt exported from a browser where you are signed in to YouTube.
+#[tauri::command]
+pub fn save_cookies(text: String) -> Result<(), String> {
+    let body = normalize_cookies(&text)?;
+    fs::write(cookie_file(), body).map_err(|e| e.to_string())?;
+    let mut memory = MEMORY.lock().unwrap();
+    memory.good = None;
+    memory.browsers_failed_at = None;
+    Ok(())
+}
+
+/// Startup check for a cookies.txt the installer copied in: tidy it up, or set it aside if invalid.
+pub fn prepare_cookies() {
+    let path = cookie_file();
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return;
+    };
+    match normalize_cookies(&raw) {
+        Ok(clean) if clean != raw => {
+            let _ = fs::write(&path, clean);
+        }
+        Ok(_) => {}
+        Err(_) => {
+            let _ = fs::rename(&path, path.with_extension("txt.invalid"));
+        }
+    }
+}
+
+#[tauri::command]
+pub fn clear_cookies() -> Result<(), String> {
+    match fs::remove_file(cookie_file()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The imported cookies.txt (or one placed next to the app).
+fn find_cookie_file() -> Option<PathBuf> {
     let beside_exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("cookies.txt")));
-    let candidates = [beside_exe, Some(store::data_dir().join("cookies.txt"))];
-    if let Some(file) = candidates.into_iter().flatten().find(|p| p.exists()) {
-        return vec!["--cookies".into(), file.to_string_lossy().into_owned()];
-    }
-    if !COOKIES_BROWSER.is_empty() {
-        return vec!["--cookies-from-browser".into(), COOKIES_BROWSER.into()];
-    }
-    Vec::new()
+    [Some(cookie_file()), beside_exe]
+        .into_iter()
+        .flatten()
+        .find(|p| p.exists())
 }
 
-/// Runs yt-dlp without cookies; if YouTube shows the bot check, retries with cookies borrowed
-/// from an installed browser (and remembers the one that worked).
+fn plan() -> Vec<Strategy> {
+    let mut order = vec![Strategy::Default];
+    order.extend(CLIENT_FALLBACKS.into_iter().map(Strategy::Client));
+    if find_cookie_file().is_some() {
+        order.push(Strategy::CookieFile);
+    }
+    if !COOKIES_BROWSER.is_empty() {
+        order.push(Strategy::Browser(COOKIES_BROWSER));
+    } else {
+        let cooling = MEMORY
+            .lock()
+            .unwrap()
+            .browsers_failed_at
+            .map_or(false, |t| t.elapsed() < AUTO_COOKIE_COOLDOWN);
+        if !cooling {
+            order.extend(AUTO_COOKIE_BROWSERS.into_iter().map(Strategy::Browser));
+        }
+    }
+    order
+}
+
+fn strategy_args(strategy: Strategy) -> Option<Vec<String>> {
+    Some(match strategy {
+        Strategy::Default => Vec::new(),
+        Strategy::Client(c) => vec![
+            "--extractor-args".into(),
+            format!("youtube:player_client={c}"),
+        ],
+        Strategy::CookieFile => vec![
+            "--cookies".into(),
+            find_cookie_file()?.to_string_lossy().into_owned(),
+        ],
+        Strategy::Browser(b) => vec!["--cookies-from-browser".into(), b.into()],
+    })
+}
+
+/// Runs yt-dlp with each strategy in turn (the one that worked last time goes first) and
+/// returns the first result that has output. A plain failure that is not the bot check
+/// (private or removed video) is final straight away.
 async fn run_smart(head: &[&str], url: &str, secs: u64) -> Result<Output, String> {
-    let explicit = explicit_cookie_args();
-    let build = |cookies: &[String]| -> Vec<String> {
+    let build = |extra: &[String]| -> Vec<String> {
         head.iter()
             .map(|s| s.to_string())
-            .chain(cookies.iter().cloned())
+            .chain(extra.iter().cloned())
             .chain([url.to_string()])
             .collect()
     };
-    let browser_args = |b: &str| vec!["--cookies-from-browser".to_string(), b.to_string()];
 
-    let remembered = COOKIES.lock().unwrap().browser;
-    if let Some(b) = remembered {
-        let out = run(&build(&browser_args(b)), secs).await?;
-        if !is_bot_error(&out.stderr) {
+    let mut order = plan();
+    let remembered = MEMORY.lock().unwrap().good;
+    if let Some(i) = remembered.and_then(|g| order.iter().position(|s| *s == g)) {
+        let first = order.remove(i);
+        order.insert(0, first);
+    }
+
+    let mut first_failure: Option<Output> = None;
+    let mut tried_browser = false;
+    for strategy in order {
+        let Some(extra) = strategy_args(strategy) else {
+            continue;
+        };
+        let out = match run(&build(&extra), secs).await {
+            Ok(out) => out,
+            Err(e) if first_failure.is_none() => return Err(e),
+            Err(_) => continue,
+        };
+        let has_output = !out.stdout.trim().is_empty();
+        let plain_failure = strategy == Strategy::Default && !is_bot_error(&out.stderr);
+        if has_output || plain_failure {
+            if has_output {
+                MEMORY.lock().unwrap().good = Some(strategy);
+            }
             return Ok(out);
         }
-        COOKIES.lock().unwrap().browser = None; // cookies expired / signed out: search again
+        if remembered == Some(strategy) {
+            MEMORY.lock().unwrap().good = None;
+        }
+        tried_browser |= matches!(strategy, Strategy::Browser(_));
+        first_failure.get_or_insert(out);
     }
 
-    let first = run(&build(&explicit), secs).await?;
-    if !is_bot_error(&first.stderr) || !explicit.is_empty() {
-        return Ok(first);
+    if tried_browser {
+        MEMORY.lock().unwrap().browsers_failed_at = Some(Instant::now());
     }
-    let failed_at = COOKIES.lock().unwrap().failed_at;
-    if failed_at.map_or(false, |t| t.elapsed() < AUTO_COOKIE_COOLDOWN) {
-        return Ok(first);
-    }
-
-    for b in AUTO_COOKIE_BROWSERS {
-        if let Ok(out) = run(&build(&browser_args(b)), secs).await {
-            if !out.stdout.trim().is_empty() && !is_bot_error(&out.stderr) {
-                COOKIES.lock().unwrap().browser = Some(b);
-                return Ok(out);
-            }
-        } // browser missing / locked / not signed in: try the next one
-    }
-    COOKIES.lock().unwrap().failed_at = Some(Instant::now());
-    Ok(first)
+    Ok(first_failure.unwrap_or(Output {
+        stdout: String::new(),
+        stderr: String::new(),
+    }))
 }
 
 /// Quick connectivity probe: three parallel connects, returns on the first success.

@@ -339,3 +339,8 @@ button, input { font-family: var(--mono); }
   cursor: pointer;
 }
 .dlg-btns button:hover { color: #000; background: var(--acc); }
+
+.dlg.info { width: 440px; height: auto; }
+.dlg.info .dlg-title { flex: none; margin-bottom: 4px; }
+.dlg.info .dlg-msg { flex: none; display: block; white-space: pre-line; line-height: 1.5; }
+.dlg.info .dlg-btns { margin-top: 8px; }

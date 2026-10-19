@@ -8,6 +8,7 @@
 
   const MAX_RETRIES = 5;                          // consecutive failures (while online) before a track is skipped
   const RETRY_DELAYS = [0, 1000, 2500, 5000, 8000]; // ms between recovery attempts
+  const SLOW_RETRY_MS = 30000;                    // longest wait between retries when nothing else can be tried
   const OFFLINE_POLL_MS = 3000;                   // how often to retry while there is no internet
   const END_TOLERANCE_MS = 4000;                  // within this of the end = the song really finished
   const STALL_TIMEOUT_S = 12;                     // playing but no progress for this long = stalled stream
@@ -114,11 +115,14 @@
     resumeTries: 0,
     resumeTryTime: 0,
     userPaused: false,
+    pausedSince: 0,      // when playback was found paused without the user asking for it
+    blockedCount: 0,     // consecutive bot-check blocks (drives the retry back-off)
     deviceGraceUntil: 0,
     lastSec: -1,
   };
 
   let cfg = { presence_enabled: false, discord_icon_key: 'harmony' };
+  let hasCookies = false;
   let sidebarExpanded = true;
   let modalOpen = 0;     // open dialogs / menus (keyboard shortcuts are paused meanwhile)
 
@@ -638,16 +642,17 @@
 
   function onResolveFailed(offline) {
     if (P.currentIndex < 0) return;
-    if (P.authBlocked && !offline) {
-      // retrying cannot fix a bot check; stop and say what to do
-      ui.now.textContent = 'YouTube blocked this: sign in to YouTube in Firefox/Chrome, or add cookies.txt';
-      P.active = false;
-      stopRetry();
-      return;
-    }
     if (offline) {                       // no internet: keep polling, never give up
       ui.now.textContent = 'Waiting for connection...';
       scheduleRetry(OFFLINE_POLL_MS);
+      return;
+    }
+    if (P.authBlocked) {
+      // skipping cannot help (every track gets blocked), so keep retrying this one with a growing delay
+      P.blockedCount++;
+      ui.now.textContent = 'YouTube blocked this - retrying... (right-click the icon > Import cookies.txt)';
+      // first retry is immediate, then 3s, 6s, 12s ... up to 30s
+      scheduleRetry(P.blockedCount === 1 ? 0 : Math.min(SLOW_RETRY_MS, 3000 * 2 ** (P.blockedCount - 2)));
       return;
     }
     P.failCount++;
@@ -684,9 +689,11 @@
       ui.now.textContent = 'Track unavailable, skipping...';
       playNext();
     } else {
-      ui.now.textContent = 'Error: ' + (P.lastError.slice(0, 90) || 'stream unavailable');
-      P.active = false;
-      audio.pause();
+      // nothing else to skip to: keep trying slowly instead of stopping for good
+      P.failCount = 0;
+      P.skipStreak = 0;
+      ui.now.textContent = 'Error: ' + (P.lastError.slice(0, 80) || 'stream unavailable') + ' - retrying...';
+      scheduleRetry(SLOW_RETRY_MS);
     }
   }
 
@@ -745,11 +752,22 @@
     if (!P.active || P.resolving || P.endHandled || retryPending()) return;
     const now = nowS();
     const state = playbackState();
-    if (state === 'paused') {          // paused by the user: nothing to watch
+    if (state === 'paused') {
+      if (P.userPaused) {              // paused by the user: nothing to watch
+        P.pausedSince = 0;
+      } else {                         // never asked for: the player refused to start, or the system paused it
+        P.pausedSince = P.pausedSince || now;
+        audio.play().catch(() => {});
+        if (now - P.pausedSince > 15) {
+          P.pausedSince = 0;
+          recover();
+        }
+      }
       P.lastProgress = now;
       P.loadStarted = now;
       return;
     }
+    P.pausedSince = 0;
     if (P.resumeMs > 0 && state === 'playing' && audio.readyState >= 3 && now - P.resumeTryTime > 2.0) {
       if (P.resumeTries < 6) {         // the seek didn't stick (song would restart): try again
         P.resumeTries++;
@@ -873,6 +891,7 @@
     if ((P.failCount || P.skipStreak) && P.resumeFloor === 0 && P.lastPos - P.resumeBase > 8000) {
       P.failCount = 0;
       P.skipStreak = 0;
+      P.blockedCount = 0;
     }
   }
 
@@ -904,6 +923,14 @@
       resetShuffle();
       playTrack(0);
     }
+  }
+
+  if ('mediaSession' in navigator) {
+    const ms = navigator.mediaSession;
+    ms.setActionHandler('play', () => { P.userPaused = false; audio.play().catch(() => {}); });
+    ms.setActionHandler('pause', () => { P.userPaused = true; audio.pause(); });
+    ms.setActionHandler('nexttrack', playNext);
+    ms.setActionHandler('previoustrack', playPrevious);
   }
 
   function resetShuffle() {
@@ -1128,6 +1155,42 @@
     document.addEventListener('keydown', onKey, true);
   }
 
+  // ------------------------------------------------------------- cookies
+
+  function importCookies() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.txt,text/plain';
+    input.addEventListener('change', async () => {
+      const file = input.files[0];
+      if (!file) return;
+      try {
+        await invoke('save_cookies', { text: await file.text() });
+        hasCookies = true;
+        ui.now.textContent = 'Cookies imported. Double-click a track to play.';
+        P.active = false;
+      } catch (e) {
+        ui.now.textContent = String(e);
+      }
+    });
+    input.click();
+  }
+
+  async function removeCookies() {
+    await invoke('clear_cookies').catch(() => {});
+    hasCookies = false;
+    ui.now.textContent = 'Cookies removed.';
+  }
+
+  function showCookieGuide() {
+    return info('How to get your cookies.txt',
+      '1. Open a private/incognito window in your browser and sign in to YouTube (a spare account is safest).\n' +
+      '2. In that same window open youtube.com/robots.txt.\n' +
+      '3. With a "Get cookies.txt LOCALLY" style extension, export the cookies for youtube.com.\n' +
+      '4. Close the private window, then right-click this icon > Import cookies.txt.\n\n' +
+      'Everyone uses their own file. It stays on this PC and is only needed when YouTube blocks playback.');
+  }
+
   // Theme / transparency menu. Only opened by right-clicking the title-bar icon.
   function showMainMenu(x, y) {
     const items = [
@@ -1144,6 +1207,9 @@
         })),
       },
     ];
+    items.push({ label: '🍪 Import cookies.txt', onClick: importCookies });
+    items.push({ label: '❓ How to get cookies', onClick: showCookieGuide });
+    if (hasCookies) items.push({ label: '🧹 Remove cookies', onClick: removeCookies });
     if (cfg.presence_enabled) {
       items.push({ label: '💬 Discord Status', checked: S.discordOn, onClick: toggleDiscord });
     }
@@ -1179,6 +1245,29 @@
       });
       wrap.querySelector('[data-ok]').addEventListener('click', () => finish(true));
       wrap.querySelector('[data-cancel]').addEventListener('click', () => finish(false));
+    });
+  }
+
+  function info(title, text) {
+    return new Promise((resolve) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'dlg-wrap';
+      wrap.innerHTML =
+        '<div class="dlg info"><div class="dlg-title"></div><div class="dlg-msg"></div>' +
+        '<div class="dlg-btns"><button tabindex="-1">OK</button></div></div>';
+      wrap.querySelector('.dlg-title').textContent = title;
+      wrap.querySelector('.dlg-msg').textContent = text;
+      document.body.appendChild(wrap);
+      modalOpen++;
+      const finish = () => {
+        document.removeEventListener('keydown', onKey, true);
+        wrap.remove();
+        modalOpen--;
+        resolve();
+      };
+      const onKey = (e) => { if (e.key === 'Escape' || e.key === 'Enter') finish(); };
+      document.addEventListener('keydown', onKey, true);
+      wrap.querySelector('button').addEventListener('click', finish);
     });
   }
 
@@ -1267,6 +1356,7 @@
       invoke('app_config').catch(() => cfg),
     ]);
     cfg = config;
+    hasCookies = await invoke('cookies_status').catch(() => false);
 
     S.themeName = THEMES[saved.theme_name] ? saved.theme_name : 'Pink';
     S.theme = THEMES[S.themeName];

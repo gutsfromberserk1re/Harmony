@@ -62,11 +62,15 @@ fn main() {
             set_presence,
             ytdlp::fetch_playlist,
             ytdlp::fetch_stream,
+            ytdlp::cookies_status,
+            ytdlp::save_cookies,
+            ytdlp::clear_cookies,
         ])
         .setup(|app| {
             if let Some(main_window) = app.get_webview_window("main") {
                 window::apply_effects(&main_window);
             }
+            ytdlp::prepare_cookies();
             tauri::async_runtime::spawn(ytdlp::prepare_and_update());
             Ok(())
         })
