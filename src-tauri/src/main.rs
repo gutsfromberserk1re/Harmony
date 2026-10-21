@@ -11,7 +11,7 @@ use serde_json::Value;
 use tauri::{Manager, State, WindowEvent};
 
 /// Discord "Application ID" (discord.com/developers/applications). "" = Discord status off.
-const DISCORD_CLIENT_ID: &str = "";
+const DISCORD_CLIENT_ID: &str = "1559860475662176308";
 /// Name of the icon you upload under Rich Presence > Art Assets.
 const DISCORD_ICON_KEY: &str = "harmony";
 
