@@ -37,8 +37,9 @@ Harmony brings the Python version into a compact native application built with *
 </p>
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/7165f7b5-fb35-4a5f-a9b6-e77f70f34b60" alt="Harmony application screenshot" width="842">
+  <img src="https://github.com/user-attachments/assets/a9e403b9-327d-4387-81ee-5ffe8e273eae" alt="Harmony application screenshot" width="842">
 </p>
+
 
 
 
