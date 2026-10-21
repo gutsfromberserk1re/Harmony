@@ -2,7 +2,7 @@
 
 **A lightweight, native desktop music player.**
 
-Harmony brings the Python version into a compact native application built with **Tauri and Rust**, combining a lightweight desktop experience with `yt-dlp` for media extraction.
+Remake of the original python software
 
 <p align="center">
   <a href="https://github.com/gutsfromberserk1re/hamonyr/releases/download/1.0.0/Harmony-installer.zip">
