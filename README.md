@@ -18,15 +18,14 @@ Harmony brings the Python version into a compact native application built with *
 </p>
 
 ---
-
+**NOTE**: IF YOUTUBE IS BLOCKING YOUR APP ADD COOKIES FROM THE MENU 
+---
 ## ✨ Highlights
 
-- **Native desktop experience** — built with Tauri and Rust.
-- **Lightweight by design** — a compact alternative to a heavier Python desktop build.
-- **Media extraction** — powered by the bundled `yt-dlp.exe`.
-- **Automatic updates** — maintains an up-to-date local copy of yt-dlp.
-- **Migration support** — automatically imports playlists and preferences from the previous Python version on first launch.
-- **Easy installation** — per-user setup with shortcuts and an uninstaller.
+- Discord rich presence
+- **EXTREMELY** Lightweight only 5 mb of ram usage
+- super clean
+- Cookies are optional 
 ---- 
 # Images 
 <p align="center">
