@@ -119,6 +119,10 @@
     blockedCount: 0,     // consecutive bot-check blocks (drives the retry back-off)
     deviceGraceUntil: 0,
     lastSec: -1,
+    prefetch: null,      // { id, url, at }: stream URL of the next track, resolved while the current one plays
+    prefetchBusy: false,
+    prefetchFailAt: 0,
+    idleSince: 0,        // since when the player has been stopped with nothing scheduled
   };
 
   let cfg = { presence_enabled: false, discord_icon_key: 'harmony' };
@@ -591,6 +595,11 @@
     ui.now.textContent = (retry ? 'Reconnecting: ' : 'Loading: ') + track.title;
 
     const req = ++P.streamReq;
+    const cached = retry || resumeMs > 0 ? '' : takePrefetch(track.id);
+    if (cached) {                       // already resolved in the background: start instantly, no yt-dlp call
+      startStream(req, { url: cached, offline: false, auth_blocked: false });
+      return;
+    }
     let result;
     try {
       result = await invoke('fetch_stream', { req, videoId: track.id });
@@ -618,6 +627,48 @@
     updateDuration();
     audio.play().catch(() => {});
     refreshPresence();
+  }
+
+  // ------------------------------------------------------------- prefetch next track
+
+  const PREFETCH_TTL_S = 2 * 3600;      // stream URLs stay valid for hours; stay well inside that
+  const PREFETCH_RETRY_S = 15;
+
+  function takePrefetch(id) {
+    const c = P.prefetch;
+    P.prefetch = null;
+    return c && c.id === id && nowS() - c.at < PREFETCH_TTL_S ? c.url : '';
+  }
+
+  function peekNextIndex() {
+    const n = P.queue.length;
+    if (n <= 1 || P.currentIndex < 0) return -1;
+    if (S.shuffle) {
+      ensureShuffleBag();
+      return P.shuffleBag[P.shuffleBag.length - 1];
+    }
+    return (P.currentIndex + 1) % n;
+  }
+
+  // While a song plays, look up the next one so the switch needs no network call at all.
+  async function maybePrefetch() {
+    if (P.prefetchBusy || !P.active || P.resolving || P.loading || S.repeat || retryPending()) return;
+    if (playbackState() !== 'playing' || P.lastPos < 3000) return;
+    if (nowS() - P.prefetchFailAt < PREFETCH_RETRY_S) return;
+    const idx = peekNextIndex();
+    if (idx < 0 || idx === P.currentIndex) return;
+    const track = P.queue[idx];
+    const c = P.prefetch;
+    if (c && c.id === track.id && nowS() - c.at < PREFETCH_TTL_S) return;
+    P.prefetchBusy = true;
+    try {
+      const res = await invoke('fetch_stream', { req: ++P.streamReq, videoId: track.id });
+      if (res && res.url) P.prefetch = { id: track.id, url: res.url, at: nowS() };
+      else P.prefetchFailAt = nowS();
+    } catch (e) {
+      P.prefetchFailAt = nowS();
+    }
+    P.prefetchBusy = false;
   }
 
   // ------------------------------------------------------------- recovery
@@ -749,8 +800,22 @@
 
   // 1 Hz safety net: catches missing end-of-track events, frozen streams and hung loads.
   function watchdogTick() {
-    if (!P.active || P.resolving || P.endHandled || retryPending()) return;
     const now = nowS();
+    maybePrefetch();
+    // Stopped, nothing loading, no retry scheduled, not paused by the user = stuck. Move on.
+    if (P.active && !P.resolving && !P.userPaused && !retryPending() && playbackState() === 'stopped') {
+      P.idleSince = P.idleSince || now;
+      if (now - P.idleSince > 4) {
+        P.idleSince = 0;
+        P.endHandled = false;
+        if (audio.ended || isNearEnd(P.lastPos)) handleTrackEnd();
+        else recover();
+        return;
+      }
+    } else {
+      P.idleSince = 0;
+    }
+    if (!P.active || P.resolving || P.endHandled || retryPending()) return;
     const state = playbackState();
     if (state === 'paused') {
       if (P.userPaused) {              // paused by the user: nothing to watch
@@ -804,6 +869,13 @@
 
   function onMediaEnded() {
     if (P.resolving) return;
+    const durMs = mediaDurationMs();
+    const posMs = positionMs();
+    if (durMs > 0 && posMs >= durMs - 2000) {      // the element itself says it played to the end
+      P.lastPos = Math.max(P.lastPos, posMs);
+      handleTrackEnd();
+      return;
+    }
     const hasLength = mediaDurationMs() > 0 || P.expectedMs > 0;
     if (isNearEnd(P.lastPos) || !hasLength) handleTrackEnd();
     else recover();                                // stream was cut short
@@ -914,8 +986,12 @@
       audio.play().catch(() => {});
     } else if (P.queue.length && P.currentIndex >= 0) {
       P.skipStreak = 0;
-      const resume = P.active && !isNearEnd(P.lastPos) ? P.lastPos : 0;
-      playTrack(P.currentIndex, resume);
+      if (P.active && (audio.ended || isNearEnd(P.lastPos)) && P.queue.length > 1) {
+        playNext();                               // song had finished: continue with the next one
+      } else {
+        const resume = P.active && !isNearEnd(P.lastPos) ? P.lastPos : 0;
+        playTrack(P.currentIndex, resume);
+      }
     } else if (P.tracks.length) {
       P.queue = P.tracks;
       P.queuePlaylist = P.currentPlaylist;
@@ -939,9 +1015,8 @@
   }
 
   // Every track plays once per round, in random order, before the bag is refilled.
-  function nextShuffleIndex() {
+  function ensureShuffleBag() {
     const n = P.queue.length;
-    if (n <= 1) return 0;
     if (!P.shuffleBag.length) {
       P.shuffleBag = [...Array(n).keys()].filter((i) => i !== P.currentIndex);
       for (let i = P.shuffleBag.length - 1; i > 0; i--) {
@@ -949,6 +1024,11 @@
         [P.shuffleBag[i], P.shuffleBag[j]] = [P.shuffleBag[j], P.shuffleBag[i]];
       }
     }
+  }
+
+  function nextShuffleIndex() {
+    if (P.queue.length <= 1) return 0;
+    ensureShuffleBag();
     return P.shuffleBag.pop();
   }
 
