@@ -36,6 +36,9 @@ static STREAM_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static UPDATE_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static EXE: OnceLock<PathBuf> = OnceLock::new();
 
+/// Error text of a lookup that was abandoned because a newer one (another track) replaced it.
+const SUPERSEDED: &str = "superseded";
+
 /// Ways of reaching YouTube, tried in this order until one returns something:
 /// plain, alternate player clients (no sign-in), the imported cookies.txt, browser cookies.
 #[derive(Clone, Copy, PartialEq)]
@@ -163,11 +166,28 @@ struct Output {
     stderr: String,
 }
 
-async fn run(args: &[String], secs: u64) -> Result<Output, String> {
+/// Completes as soon as a stream lookup newer than `req` has been asked for.
+async fn superseded(req: u64) {
+    while STREAM_REQ.load(Ordering::SeqCst) <= req {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Runs yt-dlp. With `req` set, the process is killed the moment a newer stream request arrives
+/// (the user skipped to another track), so quick next/previous presses never queue up behind it.
+async fn run(args: &[String], secs: u64, req: Option<u64>) -> Result<Output, String> {
     drop(UPDATE_LOCK.lock().await); // wait for a running self-update, then go
     let mut cmd = command(args);
-    let out = timeout(Duration::from_secs(secs), cmd.output())
-        .await
+    let work = timeout(Duration::from_secs(secs), cmd.output());
+    let finished = match req {
+        // dropping `work` kills the child process (kill_on_drop)
+        Some(r) => tokio::select! {
+            res = work => res,
+            _ = superseded(r) => return Err(SUPERSEDED.to_string()),
+        },
+        None => work.await,
+    };
+    let out = finished
         .map_err(|_| "yt-dlp timed out".to_string())?
         .map_err(|e| format!("could not start yt-dlp: {e}"))?;
     Ok(Output {
@@ -309,7 +329,7 @@ fn strategy_args(strategy: Strategy) -> Option<Vec<String>> {
 /// Runs yt-dlp with each strategy in turn (the one that worked last time goes first) and
 /// returns the first result that has output. A plain failure that is not the bot check
 /// (private or removed video) is final straight away.
-async fn run_smart(head: &[&str], url: &str, secs: u64) -> Result<Output, String> {
+async fn run_smart(head: &[&str], url: &str, secs: u64, req: Option<u64>) -> Result<Output, String> {
     let build = |extra: &[String]| -> Vec<String> {
         head.iter()
             .map(|s| s.to_string())
@@ -331,9 +351,9 @@ async fn run_smart(head: &[&str], url: &str, secs: u64) -> Result<Output, String
         let Some(extra) = strategy_args(strategy) else {
             continue;
         };
-        let out = match run(&build(&extra), secs).await {
+        let out = match run(&build(&extra), secs, req).await {
             Ok(out) => out,
-            Err(e) if first_failure.is_none() => return Err(e),
+            Err(e) if e == SUPERSEDED || first_failure.is_none() => return Err(e),
             Err(_) => continue,
         };
         let has_output = !out.stdout.trim().is_empty();
@@ -438,7 +458,7 @@ pub async fn fetch_playlist(req: u64, url: String) -> PlaylistResult {
         "--print",
         "%(id)s|%(duration)s|%(title)s",
     ];
-    match run_smart(&head, &url, 180).await {
+    match run_smart(&head, &url, 180, None).await {
         Ok(out) => {
             let tracks = parse_tracks(&out.stdout);
             if tracks.is_empty() {
@@ -483,7 +503,7 @@ pub async fn fetch_stream(req: u64, video_id: String) -> StreamResult {
                 "-g",
             ];
             let page = format!("https://www.youtube.com/watch?v={video_id}");
-            match run_smart(&head, &page, 90).await {
+            match run_smart(&head, &page, 90, Some(req)).await {
                 Ok(out) => {
                     url = out.stdout.lines().next().unwrap_or("").trim().to_string();
                     if url.is_empty() {
@@ -493,14 +513,19 @@ pub async fn fetch_stream(req: u64, video_id: String) -> StreamResult {
                 }
                 Err(e) => error = e,
             }
+        } else {
+            error = SUPERSEDED.to_string(); // a newer track was requested while this one waited
         }
     }
 
-    if !error.is_empty() {
+    if !error.is_empty() && error != SUPERSEDED {
         store::log_error(&error);
     }
-    // tells "no internet" apart from "bad video"
-    let offline = url.is_empty() && req == STREAM_REQ.load(Ordering::SeqCst) && !is_online().await;
+    // tells "no internet" apart from "bad video" (skipped for abandoned lookups)
+    let offline = url.is_empty()
+        && error != SUPERSEDED
+        && req == STREAM_REQ.load(Ordering::SeqCst)
+        && !is_online().await;
     StreamResult {
         url,
         offline,
