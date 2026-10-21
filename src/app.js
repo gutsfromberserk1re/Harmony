@@ -594,6 +594,16 @@
     if (P.queue === P.tracks) list.setCurrent(index);
     ui.now.textContent = (retry ? 'Reconnecting: ' : 'Loading: ') + track.title;
 
+    // Silence the previous song right away. Left alone it keeps playing (and firing stale events)
+    // while the new stream is looked up, which looks like being stuck on the old track.
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+    P.lastSec = -1;
+    slider.setValue(resumeMs);
+    ui.cur.textContent = fmt(resumeMs / 1000);
+    updateDuration();
+
     const req = ++P.streamReq;
     const cached = retry || resumeMs > 0 ? '' : takePrefetch(track.id);
     if (cached) {                       // already resolved in the background: start instantly, no yt-dlp call
@@ -636,8 +646,9 @@
 
   function takePrefetch(id) {
     const c = P.prefetch;
+    if (!c || c.id !== id) return '';
     P.prefetch = null;
-    return c && c.id === id && nowS() - c.at < PREFETCH_TTL_S ? c.url : '';
+    return nowS() - c.at < PREFETCH_TTL_S ? c.url : '';
   }
 
   function peekNextIndex() {
@@ -664,7 +675,7 @@
     try {
       const res = await invoke('fetch_stream', { req: ++P.streamReq, videoId: track.id });
       if (res && res.url) P.prefetch = { id: track.id, url: res.url, at: nowS() };
-      else P.prefetchFailAt = nowS();
+      else if (!res || res.error !== 'superseded') P.prefetchFailAt = nowS();   // abandoned for a newer track: not a failure
     } catch (e) {
       P.prefetchFailAt = nowS();
     }
