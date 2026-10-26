@@ -23,7 +23,7 @@ Remake of the original python software
 ## ✨ Highlights
 
 - Discord rich presence
-- **EXTREMELY** Lightweight only 5 mb of ram usage
+- **EXTREMELY** Lightweight only 5 mb of ram usage (aside from the webview it runs which consumes around 50 soooo 55-60 in total)
 - super clean
 - Cookies are optional 
 ---- 
