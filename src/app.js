@@ -119,7 +119,8 @@
     blockedCount: 0,     // consecutive bot-check blocks (drives the retry back-off)
     deviceGraceUntil: 0,
     lastSec: -1,
-    prefetch: null,      // { id, url, at }: stream URL of the next track, resolved while the current one plays
+    preload: null,       // { id, url, el, at }: the next track, resolved and already buffering in its own element
+    prefetchJob: null,   // { id, promise }: lookup of the next track that is still running
     prefetchBusy: false,
     prefetchFailAt: 0,
     idleSince: 0,        // since when the player has been stopped with nothing scheduled
@@ -130,7 +131,8 @@
   let sidebarExpanded = true;
   let modalOpen = 0;     // open dialogs / menus (keyboard shortcuts are paused meanwhile)
 
-  const audio = new Audio();
+  // `let`: the preloaded next track is a second element that replaces this one when it is due.
+  let audio = new Audio();
   audio.preload = 'auto';
 
   // ------------------------------------------------------------- persistence
@@ -605,14 +607,21 @@
     updateDuration();
 
     const req = ++P.streamReq;
-    const cached = retry || resumeMs > 0 ? '' : takePrefetch(track.id);
-    if (cached) {                       // already resolved in the background: start instantly, no yt-dlp call
-      startStream(req, { url: cached, offline: false, auth_blocked: false });
+    const reusable = !retry && resumeMs === 0;
+    let pre = reusable ? takePreload(track.id) : null;
+    if (!pre && reusable && P.prefetchJob && P.prefetchJob.id === track.id) {
+      // the background lookup for exactly this track is already running: join it, don't start over
+      await Promise.race([P.prefetchJob.promise, new Promise((r) => setTimeout(r, 20000))]);
+      if (req !== P.streamReq) return;
+      pre = takePreload(track.id);
+    }
+    if (pre) {                          // resolved and already buffering: start instantly
+      startStream(req, { url: pre.url, el: pre.el, offline: false, auth_blocked: false });
       return;
     }
     let result;
     try {
-      result = await invoke('fetch_stream', { req, videoId: track.id });
+      result = await invoke('fetch_stream', { req, videoId: track.id, retry });
     } catch (e) {
       result = { url: '', offline: false, auth_blocked: false, error: String(e) };
     }
@@ -620,7 +629,7 @@
     startStream(req, result);
   }
 
-  function startStream(req, { url, offline, auth_blocked: authBlocked }) {
+  function startStream(req, { url, el, offline, auth_blocked: authBlocked }) {
     if (req !== P.streamReq) return;
     P.resolving = false;
     P.authBlocked = !!authBlocked;
@@ -633,7 +642,8 @@
     P.loadStarted = P.lastProgress = t;
     P.lastPos = P.resumeMs;
     P.watchPos = -1;
-    audio.src = url;
+    if (el) adoptPreloaded(el);
+    else audio.src = url;
     updateDuration();
     audio.play().catch(() => {});
     refreshPresence();
@@ -644,11 +654,26 @@
   const PREFETCH_TTL_S = 2 * 3600;      // stream URLs stay valid for hours; stay well inside that
   const PREFETCH_RETRY_S = 15;
 
-  function takePrefetch(id) {
-    const c = P.prefetch;
-    if (!c || c.id !== id) return '';
-    P.prefetch = null;
-    return nowS() - c.at < PREFETCH_TTL_S ? c.url : '';
+  function disposeAudio(el) {
+    el.removeAttribute('src');
+    el.load();                           // drops the connection and the buffered data
+  }
+
+  function discardPreload() {
+    if (P.preload) disposeAudio(P.preload.el);
+    P.preload = null;
+  }
+
+  // The next track's element, if it is ready for `id`. Taking it hands ownership to the caller.
+  function takePreload(id) {
+    const c = P.preload;
+    if (!c || c.id !== id) return null;
+    P.preload = null;
+    if (c.el.error || nowS() - c.at > PREFETCH_TTL_S) {
+      disposeAudio(c.el);
+      return null;
+    }
+    return c;
   }
 
   function peekNextIndex() {
@@ -661,25 +686,43 @@
     return (P.currentIndex + 1) % n;
   }
 
-  // While a song plays, look up the next one so the switch needs no network call at all.
-  async function maybePrefetch() {
+  // While a song plays, look up the next one AND start buffering it in a second audio element, so
+  // the switch needs neither a network lookup nor a wait for the first bytes.
+  function maybePrefetch() {
     if (P.prefetchBusy || !P.active || P.resolving || P.loading || S.repeat || retryPending()) return;
     if (playbackState() !== 'playing' || P.lastPos < 3000) return;
     if (nowS() - P.prefetchFailAt < PREFETCH_RETRY_S) return;
     const idx = peekNextIndex();
     if (idx < 0 || idx === P.currentIndex) return;
     const track = P.queue[idx];
-    const c = P.prefetch;
-    if (c && c.id === track.id && nowS() - c.at < PREFETCH_TTL_S) return;
+    const c = P.preload;
+    if (c && c.id === track.id && !c.el.error && nowS() - c.at < PREFETCH_TTL_S) return;
+    discardPreload();                    // stale: other track / failed / too old
     P.prefetchBusy = true;
-    try {
-      const res = await invoke('fetch_stream', { req: ++P.streamReq, videoId: track.id });
-      if (res && res.url) P.prefetch = { id: track.id, url: res.url, at: nowS() };
-      else if (!res || res.error !== 'superseded') P.prefetchFailAt = nowS();   // abandoned for a newer track: not a failure
-    } catch (e) {
-      P.prefetchFailAt = nowS();
-    }
-    P.prefetchBusy = false;
+    const job = (async () => {
+      try {
+        // Same request id as the track that is playing now: the backend lets any newer foreground
+        // lookup cancel this one, and this one never cancels a foreground lookup.
+        const res = await invoke('fetch_stream', { req: P.streamReq, videoId: track.id, retry: false });
+        if (res && res.url) {
+          if (P.active && peekNextIndex() >= 0 && P.queue[peekNextIndex()]?.id === track.id) {
+            const el = new Audio();
+            el.preload = 'auto';
+            el.src = res.url;
+            el.load();
+            discardPreload();
+            P.preload = { id: track.id, url: res.url, el, at: nowS() };
+          }
+        } else if (!res || res.error !== 'superseded') {
+          P.prefetchFailAt = nowS();     // abandoned for a newer track: not a failure
+        }
+      } catch (e) {
+        P.prefetchFailAt = nowS();
+      }
+      P.prefetchBusy = false;
+      if (P.prefetchJob && P.prefetchJob.id === track.id) P.prefetchJob = null;
+    })();
+    P.prefetchJob = { id: track.id, promise: job };
   }
 
   // ------------------------------------------------------------- recovery
@@ -712,7 +755,9 @@
     if (P.authBlocked) {
       // skipping cannot help (every track gets blocked), so keep retrying this one with a growing delay
       P.blockedCount++;
-      ui.now.textContent = 'YouTube blocked this - retrying... (right-click the icon > Import cookies.txt)';
+      ui.now.textContent = hasCookies
+        ? 'YouTube blocked this even with your cookies - they may have expired. Re-import cookies.txt - retrying...'
+        : 'YouTube blocked this - retrying... (right-click the icon > Import cookies.txt)';
       // first retry is immediate, then 3s, 6s, 12s ... up to 30s
       scheduleRetry(P.blockedCount === 1 ? 0 : Math.min(SLOW_RETRY_MS, 3000 * 2 ** (P.blockedCount - 2)));
       return;
@@ -921,15 +966,36 @@
     refreshPresence();
   }
 
-  audio.addEventListener('loadedmetadata', onMediaLoaded);
-  audio.addEventListener('canplay', onMediaLoaded);
-  audio.addEventListener('ended', onMediaEnded);
-  audio.addEventListener('error', onPlayerError);
-  audio.addEventListener('durationchange', updateDuration);
-  audio.addEventListener('timeupdate', () => updatePosition(positionMs()));
-  audio.addEventListener('seeked', () => updatePosition(positionMs()));
-  ['play', 'playing', 'pause', 'ended', 'error', 'emptied', 'loadstart'].forEach((ev) =>
-    audio.addEventListener(ev, syncPlaybackState));
+  // All player events are attached to whichever element is current; swapping in the preloaded
+  // element detaches the old one first so it can never fire stale events.
+  let audioListeners = null;
+  function wireAudio(el) {
+    audioListeners?.abort();
+    audioListeners = new AbortController();
+    const opt = { signal: audioListeners.signal };
+    el.addEventListener('loadedmetadata', onMediaLoaded, opt);
+    el.addEventListener('canplay', onMediaLoaded, opt);
+    el.addEventListener('ended', onMediaEnded, opt);
+    el.addEventListener('error', onPlayerError, opt);
+    el.addEventListener('durationchange', updateDuration, opt);
+    el.addEventListener('timeupdate', () => updatePosition(positionMs()), opt);
+    el.addEventListener('seeked', () => updatePosition(positionMs()), opt);
+    ['play', 'playing', 'pause', 'ended', 'error', 'emptied', 'loadstart'].forEach((ev) =>
+      el.addEventListener(ev, syncPlaybackState, opt));
+  }
+  wireAudio(audio);
+
+  function adoptPreloaded(el) {
+    const old = audio;
+    audioListeners?.abort();            // old element: no more events
+    audioListeners = null;
+    old.pause();
+    old.removeAttribute('src');
+    old.load();
+    el.volume = old.volume;
+    audio = el;
+    wireAudio(audio);
+  }
   setInterval(() => { if (playbackState() === 'playing') updatePosition(positionMs()); }, 100);
 
   function updatePosition(position) {

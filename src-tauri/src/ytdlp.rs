@@ -14,7 +14,12 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use tokio::{net::TcpStream, process::Command, sync::Mutex as AsyncMutex, time::timeout};
+use tokio::{
+    net::TcpStream,
+    process::Command,
+    sync::{Mutex as AsyncMutex, RwLock},
+    time::timeout,
+};
 
 use crate::store;
 
@@ -27,21 +32,42 @@ const AUTO_COOKIE_BROWSERS: [&str; 4] = ["firefox", "chrome", "edge", "brave"];
 const CLIENT_FALLBACKS: [&str; 3] = ["android_vr", "tv", "web_safari"];
 const AUTO_COOKIE_COOLDOWN: Duration = Duration::from_secs(600);
 const UPDATE_INTERVAL: Duration = Duration::from_secs(12 * 3600);
+/// After a failed self-update, wait this long before trying again (instead of on every launch).
+const UPDATE_RETRY: Duration = Duration::from_secs(3600);
+
+/// Time budget per yt-dlp attempt / for all attempts of one lookup together.
+const STREAM_ATTEMPT_SECS: u64 = 45;
+const STREAM_TOTAL_SECS: u64 = 150;
+const PLAYLIST_ATTEMPT_SECS: u64 = 120;
+const PLAYLIST_TOTAL_SECS: u64 = 300;
+
+/// Only direct HTTP(S) audio can be played by the <audio> element. HLS (m3u8) / DASH manifests
+/// make yt-dlp print a URL that then never plays, so they are not allowed here: a strategy that
+/// can only offer those counts as failed and the next strategy gets its turn.
+const STREAM_FORMAT: &str = "ba[protocol=https]/ba[protocol=http]/b[protocol=https]/b[protocol=http]";
 
 static PLAYLIST_REQ: AtomicU64 = AtomicU64::new(0);
 static STREAM_REQ: AtomicU64 = AtomicU64::new(0);
 /// One stream lookup at a time.
 static STREAM_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
-/// Held while yt-dlp updates itself so no lookup starts on a half-replaced exe.
-static UPDATE_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+/// Every yt-dlp process holds this shared while it runs. The updater only takes it exclusively
+/// for the instant it swaps the freshly updated exe in, so lookups never wait for a download.
+static EXE_LOCK: RwLock<()> = RwLock::const_new(());
 static EXE: OnceLock<PathBuf> = OnceLock::new();
+/// Serialises writing cookies back to disk; bumped when the user imports/removes cookies so a
+/// slow, older yt-dlp run can never overwrite a fresh import.
+static COOKIE_COMMIT: Mutex<()> = Mutex::new(());
+static COOKIE_GEN: AtomicU64 = AtomicU64::new(0);
+static COOKIE_RUN: AtomicU64 = AtomicU64::new(0);
+/// The strategy that produced the URL we last handed out (and for which video).
+static LAST_STREAM: Mutex<Option<(String, Strategy)>> = Mutex::new(None);
 
 /// Error text of a lookup that was abandoned because a newer one (another track) replaced it.
 const SUPERSEDED: &str = "superseded";
 
 /// Ways of reaching YouTube, tried in this order until one returns something:
 /// plain, alternate player clients (no sign-in), the imported cookies.txt, browser cookies.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Strategy {
     Default,
     Client(&'static str),
@@ -111,8 +137,8 @@ fn exe() -> &'static PathBuf {
     })
 }
 
-fn command(args: &[String]) -> Command {
-    let mut cmd = Command::new(exe());
+fn command_for(program: &Path, args: &[String]) -> Command {
+    let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
         .kill_on_drop(true)
@@ -131,32 +157,90 @@ fn command(args: &[String]) -> Command {
     cmd
 }
 
-/// Called once at startup: prepares the local copy and updates it (at most every 12 hours).
+fn command(args: &[String]) -> Command {
+    command_for(exe(), args)
+}
+
+fn cache_dir() -> PathBuf {
+    let dir = store::data_dir().join("ytdlp-cache");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn age_of(path: &Path) -> Option<Duration> {
+    modified(path)?.elapsed().ok()
+}
+
+/// Called once at startup. Updates a *copy* of yt-dlp in the background (at most every 12 hours)
+/// and swaps it in only when it runs and no lookup is using the exe. Lookups never wait for it.
 pub async fn prepare_and_update() {
     let path = exe().clone();
     let data = store::data_dir();
-    let marker = data.join("ytdlp.checked");
-    let fresh = modified(&marker)
-        .and_then(|t| t.elapsed().ok())
-        .map_or(false, |age| age < UPDATE_INTERVAL);
-    if fresh || !path.starts_with(&data) {
+    let (ok_marker, fail_marker) = (data.join("ytdlp.checked"), data.join("ytdlp.failed"));
+    if !path.starts_with(&data)
+        || age_of(&ok_marker).map_or(false, |a| a < UPDATE_INTERVAL)
+        || age_of(&fail_marker).map_or(false, |a| a < UPDATE_RETRY)
+    {
         return;
     }
+    tokio::time::sleep(Duration::from_secs(15)).await; // let the first lookups go first
 
-    let _guard = UPDATE_LOCK.lock().await;
-    let args: Vec<String> = ["--update-to", "nightly", "--no-warnings"].map(String::from).to_vec();
-    let mut cmd = command(&args);
-    match timeout(Duration::from_secs(30), cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => {
-            let _ = fs::write(&marker, b"");
-        }
-        Ok(Ok(out)) => store::log_error(&format!(
-            "yt-dlp update failed: {}",
-            error_line(&String::from_utf8_lossy(&out.stderr))
-        )),
-        Ok(Err(e)) => store::log_error(&format!("yt-dlp update failed: {e}")),
-        Err(_) => store::log_error("yt-dlp update timed out"),
+    let staged = data.join("yt-dlp.update.exe");
+    let cleanup = || {
+        let _ = fs::remove_file(&staged);
+        let _ = fs::remove_file(data.join("yt-dlp.update.exe.old"));
+    };
+    cleanup();
+    let fail = |why: String| {
+        store::log_error(&format!("yt-dlp update failed: {why}"));
+        let _ = fs::write(&fail_marker, b"");
+    };
+    if let Err(e) = fs::copy(&path, &staged) {
+        return fail(e.to_string());
     }
+
+    let update: Vec<String> = ["--update-to", "nightly", "--no-warnings"].map(String::from).to_vec();
+    match timeout(Duration::from_secs(180), command_for(&staged, &update).output()).await {
+        Ok(Ok(out)) if out.status.success() => {}
+        Ok(Ok(out)) => {
+            cleanup();
+            return fail(error_line(&String::from_utf8_lossy(&out.stderr)));
+        }
+        Ok(Err(e)) => {
+            cleanup();
+            return fail(e.to_string());
+        }
+        Err(_) => {
+            cleanup();
+            return fail("timed out".into());
+        }
+    }
+    // the updated copy must still start before it replaces the working one
+    let version: Vec<String> = vec!["--version".into()];
+    let sane = matches!(
+        timeout(Duration::from_secs(20), command_for(&staged, &version).output()).await,
+        Ok(Ok(o)) if o.status.success()
+    );
+    if !sane {
+        cleanup();
+        return fail("updated yt-dlp does not start".into());
+    }
+    for _ in 0..150 {
+        if let Ok(_exclusive) = EXE_LOCK.try_write() {
+            match fs::rename(&staged, &path) {
+                Ok(()) => {
+                    let _ = fs::write(&ok_marker, b"");
+                    let _ = fs::remove_file(&fail_marker);
+                }
+                Err(e) => fail(e.to_string()),
+            }
+            cleanup();
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    cleanup();
+    fail("exe stayed busy".into());
 }
 
 // ----------------------------------------------------------------- running
@@ -176,7 +260,10 @@ async fn superseded(req: u64) {
 /// Runs yt-dlp. With `req` set, the process is killed the moment a newer stream request arrives
 /// (the user skipped to another track), so quick next/previous presses never queue up behind it.
 async fn run(args: &[String], secs: u64, req: Option<u64>) -> Result<Output, String> {
-    drop(UPDATE_LOCK.lock().await); // wait for a running self-update, then go
+    let _shared = EXE_LOCK.read().await; // only blocked for the instant an update is swapped in
+    if req.map_or(false, |r| STREAM_REQ.load(Ordering::SeqCst) > r) {
+        return Err(SUPERSEDED.to_string());
+    }
     let mut cmd = command(args);
     let work = timeout(Duration::from_secs(secs), cmd.output());
     let finished = match req {
@@ -201,6 +288,22 @@ fn is_bot_error(stderr: &str) -> bool {
     s.contains("confirm you") && s.contains("bot")
 }
 
+/// Errors where no other way of reaching YouTube can help.
+fn is_permanent(stderr: &str) -> bool {
+    let s = stderr.to_lowercase();
+    [
+        "has been removed",
+        "has been deleted",
+        "no longer available",
+        "has been terminated",
+        "available in your country",
+        "blocked it in your country",
+        "playlist does not exist",
+    ]
+    .iter()
+    .any(|m| s.contains(m))
+}
+
 fn error_line(stderr: &str) -> String {
     stderr
         .lines()
@@ -211,6 +314,8 @@ fn error_line(stderr: &str) -> String {
         .trim()
         .to_string()
 }
+
+// ----------------------------------------------------------------- cookies
 
 fn cookie_file() -> PathBuf {
     store::data_dir().join("cookies.txt")
@@ -242,19 +347,56 @@ fn normalize_cookies(text: &str) -> Result<String, String> {
     })
 }
 
+/// A cookies file without a signed-in session cannot help YouTube at all (this is the usual reason
+/// "importing cookies changes nothing"): exported from a window that was not signed in, or from
+/// the wrong site.
+fn has_session(text: &str) -> bool {
+    const NAMES: [&str; 10] = [
+        "SID", "SAPISID", "APISID", "HSID", "SSID", "LOGIN_INFO",
+        "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID",
+    ];
+    text.lines().any(|l| {
+        let f: Vec<&str> = l.split('\t').collect();
+        f.len() >= 7
+            && (f[0].contains("youtube.com") || f[0].contains("google.com"))
+            && NAMES.contains(&f[5].trim())
+    })
+}
+
 /// Stores a cookies.txt exported from a browser where you are signed in to YouTube.
 #[tauri::command]
 pub fn save_cookies(text: String) -> Result<(), String> {
     let body = normalize_cookies(&text)?;
-    fs::write(cookie_file(), body).map_err(|e| e.to_string())?;
+    if !has_session(&body) {
+        return Err("No signed-in YouTube session in this file. Sign in first, then export again.".into());
+    }
+    {
+        let _commit = COOKIE_COMMIT.lock().unwrap();
+        COOKIE_GEN.fetch_add(1, Ordering::SeqCst);
+        write_atomic(&cookie_file(), &body)?;
+    }
     let mut memory = MEMORY.lock().unwrap();
     memory.good = None;
     memory.browsers_failed_at = None;
     Ok(())
 }
 
+fn write_atomic(target: &Path, text: &str) -> Result<(), String> {
+    let tmp = target.with_extension("txt.tmp");
+    fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, target).map_err(|e| e.to_string())
+}
+
 /// Startup check for a cookies.txt the installer copied in: tidy it up, or set it aside if invalid.
 pub fn prepare_cookies() {
+    // leftovers of runs that were killed
+    if let Ok(dir) = fs::read_dir(store::data_dir()) {
+        for e in dir.flatten() {
+            if e.file_name().to_string_lossy().starts_with("cookies.run") {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
     let path = cookie_file();
     let Ok(raw) = fs::read_to_string(&path) else {
         return;
@@ -272,6 +414,8 @@ pub fn prepare_cookies() {
 
 #[tauri::command]
 pub fn clear_cookies() -> Result<(), String> {
+    let _commit = COOKIE_COMMIT.lock().unwrap();
+    COOKIE_GEN.fetch_add(1, Ordering::SeqCst);
     match fs::remove_file(cookie_file()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -289,6 +433,42 @@ fn find_cookie_file() -> Option<PathBuf> {
         .flatten()
         .find(|p| p.exists())
 }
+
+/// yt-dlp rewrites the cookies file it is given when it exits. Several lookups run at the same
+/// time (playlist, track, prefetch), so each one works on its own private copy; handing them the
+/// real file made them overwrite each other and left a truncated cookies.txt behind.
+struct StagedCookies {
+    path: PathBuf,
+    original: String,
+    generation: u64,
+}
+
+fn stage_cookies() -> Option<StagedCookies> {
+    let src = find_cookie_file()?;
+    let original = fs::read_to_string(&src).ok()?;
+    let generation = COOKIE_GEN.load(Ordering::SeqCst);
+    let path = store::data_dir().join(format!("cookies.run{}.txt", COOKIE_RUN.fetch_add(1, Ordering::SeqCst)));
+    fs::write(&path, &original).ok()?;
+    Some(StagedCookies { path, original, generation })
+}
+
+/// Keeps the cookies YouTube refreshed during the run, but only if the copy is still a valid
+/// cookies file and the user has not imported/removed cookies in the meantime.
+fn finish_cookies(staged: StagedCookies) {
+    if let Ok(now) = fs::read_to_string(&staged.path) {
+        if now != staged.original {
+            if let Ok(clean) = normalize_cookies(&now) {
+                let _commit = COOKIE_COMMIT.lock().unwrap();
+                if COOKIE_GEN.load(Ordering::SeqCst) == staged.generation {
+                    let _ = write_atomic(&cookie_file(), &clean);
+                }
+            }
+        }
+    }
+    let _ = fs::remove_file(&staged.path);
+}
+
+// ----------------------------------------------------------------- strategies
 
 fn plan() -> Vec<Strategy> {
     let mut order = vec![Strategy::Default];
@@ -311,28 +491,38 @@ fn plan() -> Vec<Strategy> {
     order
 }
 
-fn strategy_args(strategy: Strategy) -> Option<Vec<String>> {
-    Some(match strategy {
+fn strategy_args(strategy: Strategy, cookies: Option<&StagedCookies>) -> Vec<String> {
+    match strategy {
         Strategy::Default => Vec::new(),
         Strategy::Client(c) => vec![
             "--extractor-args".into(),
             format!("youtube:player_client={c}"),
         ],
-        Strategy::CookieFile => vec![
-            "--cookies".into(),
-            find_cookie_file()?.to_string_lossy().into_owned(),
-        ],
+        Strategy::CookieFile => cookies
+            .map(|c| vec!["--cookies".into(), c.path.to_string_lossy().into_owned()])
+            .unwrap_or_default(),
         Strategy::Browser(b) => vec!["--cookies-from-browser".into(), b.into()],
-    })
+    }
 }
 
-/// Runs yt-dlp with each strategy in turn (the one that worked last time goes first) and
-/// returns the first result that has output. A plain failure that is not the bot check
-/// (private or removed video) is final straight away.
-async fn run_smart(head: &[&str], url: &str, secs: u64, req: Option<u64>) -> Result<Output, String> {
+/// Runs yt-dlp with each strategy in turn (the one that worked last time goes first, the one that
+/// gave an unplayable URL last time goes last) and returns the first result that has output,
+/// together with the strategy that produced it. Only errors that no strategy can fix (removed or
+/// region-blocked video) end the search early; anything else - sign-in, 403, "format not
+/// available", a timeout - moves on to the next way of reaching YouTube.
+async fn run_smart(
+    head: &[&str],
+    url: &str,
+    attempt_secs: u64,
+    total_secs: u64,
+    req: Option<u64>,
+    avoid: Option<Strategy>,
+) -> Result<(Output, Option<Strategy>), String> {
+    let cache = cache_dir().to_string_lossy().into_owned();
     let build = |extra: &[String]| -> Vec<String> {
-        head.iter()
-            .map(|s| s.to_string())
+        ["--cache-dir".to_string(), cache.clone()]
+            .into_iter()
+            .chain(head.iter().map(|s| s.to_string()))
             .chain(extra.iter().cloned())
             .chain([url.to_string()])
             .collect()
@@ -340,44 +530,78 @@ async fn run_smart(head: &[&str], url: &str, secs: u64, req: Option<u64>) -> Res
 
     let mut order = plan();
     let remembered = MEMORY.lock().unwrap().good;
-    if let Some(i) = remembered.and_then(|g| order.iter().position(|s| *s == g)) {
+    if let Some(a) = avoid {
+        let mut memory = MEMORY.lock().unwrap();
+        if memory.good == Some(a) {
+            memory.good = None; // it hands out URLs that do not play: stop preferring it
+        }
+    }
+    if let Some(i) = remembered
+        .filter(|g| Some(*g) != avoid)
+        .and_then(|g| order.iter().position(|s| *s == g))
+    {
         let first = order.remove(i);
         order.insert(0, first);
     }
+    if let Some(i) = avoid.and_then(|a| order.iter().position(|s| *s == a)) {
+        let last = order.remove(i);
+        order.push(last);
+    }
 
-    let mut first_failure: Option<Output> = None;
+    let deadline = Instant::now() + Duration::from_secs(total_secs);
+    let mut failure: Option<Output> = None;
     let mut tried_browser = false;
     for strategy in order {
-        let Some(extra) = strategy_args(strategy) else {
+        let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+        if left < 5 {
+            break;
+        }
+        let staged = if strategy == Strategy::CookieFile { stage_cookies() } else { None };
+        if strategy == Strategy::CookieFile && staged.is_none() {
             continue;
-        };
-        let out = match run(&build(&extra), secs, req).await {
+        }
+        let extra = strategy_args(strategy, staged.as_ref());
+        let result = run(&build(&extra), attempt_secs.min(left), req).await;
+        if let Some(s) = staged {
+            finish_cookies(s);
+        }
+        let out = match result {
             Ok(out) => out,
-            Err(e) if e == SUPERSEDED || first_failure.is_none() => return Err(e),
-            Err(_) => continue,
-        };
-        let has_output = !out.stdout.trim().is_empty();
-        let plain_failure = strategy == Strategy::Default && !is_bot_error(&out.stderr);
-        if has_output || plain_failure {
-            if has_output {
-                MEMORY.lock().unwrap().good = Some(strategy);
+            Err(e) if e == SUPERSEDED || e.starts_with("could not start") => return Err(e),
+            Err(e) => {
+                store::log_error(&format!("{strategy:?}: {e}"));
+                tried_browser |= matches!(strategy, Strategy::Browser(_));
+                continue; // a timeout is not final: the next strategy may be quicker
             }
-            return Ok(out);
+        };
+        if !out.stdout.trim().is_empty() {
+            MEMORY.lock().unwrap().good = Some(strategy);
+            return Ok((out, Some(strategy)));
+        }
+        store::log_error(&format!("{strategy:?}: {}", error_line(&out.stderr)));
+        if is_permanent(&out.stderr) {
+            return Ok((out, None));
         }
         if remembered == Some(strategy) {
             MEMORY.lock().unwrap().good = None;
         }
         tried_browser |= matches!(strategy, Strategy::Browser(_));
-        first_failure.get_or_insert(out);
+        // keep the most telling failure (the bot check is what the UI reacts to)
+        let better = failure
+            .as_ref()
+            .map_or(true, |f| !is_bot_error(&f.stderr) && is_bot_error(&out.stderr));
+        if better {
+            failure = Some(out);
+        }
     }
 
     if tried_browser {
         MEMORY.lock().unwrap().browsers_failed_at = Some(Instant::now());
     }
-    Ok(first_failure.unwrap_or(Output {
-        stdout: String::new(),
-        stderr: String::new(),
-    }))
+    Ok((
+        failure.unwrap_or(Output { stdout: String::new(), stderr: String::new() }),
+        None,
+    ))
 }
 
 /// Quick connectivity probe: three parallel connects, returns on the first success.
@@ -452,14 +676,13 @@ pub async fn fetch_playlist(req: u64, url: String) -> PlaylistResult {
         "--flat-playlist",
         "--ignore-errors",
         "--no-warnings",
-        "--no-cache-dir",
         "--socket-timeout",
         "15",
         "--print",
         "%(id)s|%(duration)s|%(title)s",
     ];
-    match run_smart(&head, &url, 180, None).await {
-        Ok(out) => {
+    match run_smart(&head, &url, PLAYLIST_ATTEMPT_SECS, PLAYLIST_TOTAL_SECS, None, None).await {
+        Ok((out, _)) => {
             let tracks = parse_tracks(&out.stdout);
             if tracks.is_empty() {
                 let error = error_line(&out.stderr);
@@ -482,33 +705,49 @@ pub async fn fetch_playlist(req: u64, url: String) -> PlaylistResult {
 
 // ----------------------------------------------------------------- streams
 
+/// `req` is the id of the newest *foreground* lookup. The background prefetch of the next track
+/// passes the id that is already current (it does not count up), so it can never cancel a track
+/// the user asked for, while the next foreground lookup cancels it. `retry` = the URL handed out
+/// for this video last time did not play: try a different way of reaching YouTube.
 #[tauri::command]
-pub async fn fetch_stream(req: u64, video_id: String) -> StreamResult {
+pub async fn fetch_stream(req: u64, video_id: String, retry: Option<bool>) -> StreamResult {
     STREAM_REQ.fetch_max(req, Ordering::SeqCst);
     let mut url = String::new();
     let mut error = String::new();
     let mut auth_blocked = false;
+
+    let avoid = if retry.unwrap_or(false) {
+        LAST_STREAM
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(id, _)| *id == video_id)
+            .map(|(_, s)| *s)
+    } else {
+        None
+    };
 
     {
         let _one_at_a_time = STREAM_LOCK.lock().await;
         if req == STREAM_REQ.load(Ordering::SeqCst) {
             let head = [
                 "-f",
-                "bestaudio/best",
+                STREAM_FORMAT,
                 "--no-playlist",
                 "--no-warnings",
-                "--no-cache-dir",
                 "--socket-timeout",
                 "15",
                 "-g",
             ];
             let page = format!("https://www.youtube.com/watch?v={video_id}");
-            match run_smart(&head, &page, 90, Some(req)).await {
-                Ok(out) => {
+            match run_smart(&head, &page, STREAM_ATTEMPT_SECS, STREAM_TOTAL_SECS, Some(req), avoid).await {
+                Ok((out, used)) => {
                     url = out.stdout.lines().next().unwrap_or("").trim().to_string();
                     if url.is_empty() {
                         auth_blocked = is_bot_error(&out.stderr);
                         error = error_line(&out.stderr);
+                    } else if let Some(s) = used {
+                        *LAST_STREAM.lock().unwrap() = Some((video_id.clone(), s));
                     }
                 }
                 Err(e) => error = e,
