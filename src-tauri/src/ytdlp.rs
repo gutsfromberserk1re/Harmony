@@ -61,7 +61,11 @@ static COOKIE_COMMIT: Mutex<()> = Mutex::new(());
 static COOKIE_GEN: AtomicU64 = AtomicU64::new(0);
 static COOKIE_RUN: AtomicU64 = AtomicU64::new(0);
 /// The strategy that produced the URL we last handed out (and for which video).
-static LAST_STREAM: Mutex<HashMap<String, Strategy>> = Mutex::new(HashMap::new());
+static LAST_STREAM: OnceLock<Mutex<HashMap<String, Strategy>>> = OnceLock::new();
+
+fn last_stream() -> &'static Mutex<HashMap<String, Strategy>> {
+    LAST_STREAM.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Error text of a lookup that was abandoned because a newer one (another track) replaced it.
 const SUPERSEDED: &str = "superseded";
@@ -740,7 +744,7 @@ pub async fn fetch_stream(req: u64, video_id: String, retry: Option<bool>) -> St
     let mut auth_blocked = false;
 
     let avoid = if retry.unwrap_or(false) {
-        LAST_STREAM
+        last_stream()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&video_id)
@@ -769,7 +773,7 @@ pub async fn fetch_stream(req: u64, video_id: String, retry: Option<bool>) -> St
                             Ok(local_url) => {
                                 url = local_url;
                                 if let Some(strategy) = used {
-                                    let mut last = LAST_STREAM.lock().unwrap_or_else(|p| p.into_inner());
+                                    let mut last = last_stream().lock().unwrap_or_else(|p| p.into_inner());
                                     last.insert(video_id.clone(), strategy);
                                     if last.len() > 256 {
                                         if let Some(key) = last.keys().next().cloned() {
