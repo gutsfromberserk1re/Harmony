@@ -7,8 +7,8 @@
 
 use futures_util::StreamExt;
 use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, ACCEPT_RANGES, CONNECTION,
-    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST, IF_RANGE, RANGE, USER_AGENT,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, CONNECTION,
+    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HOST, IF_RANGE, RANGE, REFERER, USER_AGENT,
 };
 use std::{
     collections::HashMap,
@@ -139,6 +139,87 @@ pub fn register(url: String, headers: HashMap<String, String>) -> Result<String,
     Ok(format!("{base}/stream/{token}"))
 }
 
+fn build_upstream_headers(
+    source_headers: &HashMap<String, String>,
+    requested_range: Option<&str>,
+    if_range: Option<&str>,
+) -> HeaderMap {
+    let mut upstream_headers = HeaderMap::new();
+    for (name, value) in source_headers {
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        if name == HOST
+            || name == RANGE
+            || name == IF_RANGE
+            || name == ACCEPT_ENCODING
+            || name == CONTENT_LENGTH
+            || name == CONNECTION
+        {
+            continue;
+        }
+        let Ok(value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        upstream_headers.insert(name, value);
+    }
+    upstream_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    if !upstream_headers.contains_key(ACCEPT) {
+        upstream_headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+    }
+    if !upstream_headers.contains_key(REFERER) {
+        upstream_headers.insert(REFERER, HeaderValue::from_static("https://www.youtube.com/"));
+    }
+    if !upstream_headers.contains_key(USER_AGENT) {
+        upstream_headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"),
+        );
+    }
+    if let Some(range) = requested_range.and_then(|v| HeaderValue::from_str(v).ok()) {
+        upstream_headers.insert(RANGE, range);
+    }
+    if let Some(range) = if_range.and_then(|v| HeaderValue::from_str(v).ok()) {
+        upstream_headers.insert(IF_RANGE, range);
+    }
+    upstream_headers
+}
+
+/// Probe a direct media URL with a tiny byte-range request before exposing it to WebView2.
+/// This catches some expired or rejected URLs before the player enters its reconnect loop.
+pub async fn validate(url: &str, headers: &HashMap<String, String>) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("yt-dlp returned a non-HTTP media URL".into());
+    }
+    let client = HTTP_CLIENT
+        .get()
+        .ok_or_else(|| "media HTTP client is not initialized".to_string())?;
+    let request_headers = build_upstream_headers(headers, Some("bytes=0-0"), None);
+    let response = tokio::time::timeout(
+        Duration::from_secs(8),
+        client.get(url).headers(request_headers).send(),
+    )
+    .await
+    .map_err(|_| "timed out validating YouTube media URL".to_string())?
+    .map_err(|e| format!("could not validate YouTube media URL: {e}"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown host".to_string());
+    store::log_error(&format!(
+        "media URL validation returned HTTP {} from {}",
+        status.as_u16(), host
+    ));
+    Err(format!(
+        "YouTube rejected this media URL (HTTP {}). Trying another stream source...",
+        status.as_u16()
+    ))
+}
+
 async fn handle_request(mut socket: TcpStream) -> Result<(), String> {
     let raw = read_request_headers(&mut socket).await?;
     let text = String::from_utf8_lossy(&raw);
@@ -191,39 +272,11 @@ async fn handle_request(mut socket: TcpStream) -> Result<(), String> {
     let client = HTTP_CLIENT
         .get()
         .ok_or_else(|| "media HTTP client is not initialized".to_string())?;
-    let mut upstream_headers = HeaderMap::new();
-    for (name, value) in &source.headers {
-        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
-            continue;
-        };
-        // Host and transfer-specific headers belong to reqwest/the upstream connection.
-        if name == HOST
-            || name == RANGE
-            || name == IF_RANGE
-            || name == ACCEPT_ENCODING
-            || name == CONTENT_LENGTH
-            || name == CONNECTION
-        {
-            continue;
-        }
-        let Ok(value) = HeaderValue::from_str(value) else {
-            continue;
-        };
-        upstream_headers.insert(name, value);
-    }
-    upstream_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    if !upstream_headers.contains_key(USER_AGENT) {
-        upstream_headers.insert(
-            USER_AGENT,
-            HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"),
-        );
-    }
-    if let Some(range) = requested_range.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
-        upstream_headers.insert(RANGE, range);
-    }
-    if let Some(range) = if_range.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
-        upstream_headers.insert(IF_RANGE, range);
-    }
+    let upstream_headers = build_upstream_headers(
+        &source.headers,
+        requested_range.as_deref(),
+        if_range.as_deref(),
+    );
 
     let response = match client
         .get(&source.url)
@@ -240,7 +293,11 @@ async fn handle_request(mut socket: TcpStream) -> Result<(), String> {
 
     let status = response.status();
     if !status.is_success() {
-        store::log_error(&format!("media relay upstream returned HTTP {}", status.as_u16()));
+        let host = reqwest::Url::parse(&source.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown host".to_string());
+        store::log_error(&format!("media relay upstream returned HTTP {} from {} (the stream URL may have expired or been rejected; retry will re-extract it)", status.as_u16(), host));
     }
     let reason = status.canonical_reason().unwrap_or("Upstream Response");
     let content_type = response

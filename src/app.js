@@ -766,8 +766,8 @@
       // skipping cannot help (every track gets blocked), so keep retrying this one with a growing delay
       P.blockedCount++;
       ui.now.textContent = hasCookies
-        ? 'YouTube blocked this even with your cookies - they may have expired. Re-import cookies.txt - retrying...'
-        : 'YouTube blocked this - retrying... (right-click the icon > Import cookies.txt)';
+        ? 'YouTube still blocks this track. Cookies may be stale or a playback token may be required - retrying...'
+        : 'YouTube blocked this track - right-click the icon > Import cookies.txt, then retry.';
       // first retry is immediate, then 3s, 6s, 12s ... up to 30s
       scheduleRetry(P.blockedCount === 1 ? 0 : Math.min(SLOW_RETRY_MS, 3000 * 2 ** (P.blockedCount - 2)));
       return;
@@ -1367,11 +1367,11 @@
 
   function showCookieGuide() {
     return info('How to get your cookies.txt',
-      '1. Open a private/incognito window in your browser and sign in to YouTube (a spare account is safest).\n' +
-      '2. In that same window open youtube.com/robots.txt.\n' +
-      '3. With a "Get cookies.txt LOCALLY" style extension, export the cookies for youtube.com.\n' +
-      '4. Close the private window, then right-click this icon > Import cookies.txt.\n\n' +
-      'Everyone uses their own file. It stays on this PC and is only needed when YouTube blocks playback.');
+      '1. Open a private/incognito window and sign in to YouTube (a spare account is safest).\n' +
+      '2. Open a second tab at https://www.youtube.com/robots.txt, then close the original YouTube tab without reopening it.\n' +
+      '3. While the private window is still open, export youtube.com cookies in Netscape/cookies.txt format with a reputable export extension (allow it in private mode if needed).\n' +
+      '4. Right-click the Harmony icon > Import cookies.txt, then close the private window without reopening YouTube.\n\n' +
+      'Cookies are login-session credentials. Keep the file private; Harmony stores it locally on this PC.');
   }
 
   // Theme / transparency menu. Only opened by right-clicking the title-bar icon.

@@ -328,7 +328,9 @@ fn cookie_file() -> PathBuf {
 
 #[tauri::command]
 pub fn cookies_status() -> bool {
-    cookie_file().exists()
+    // Also recognise a manually placed cookies.txt beside the executable. This is useful for
+    // portable installs and keeps the UI status in sync with the file lookup used by yt-dlp.
+    find_cookie_file().is_some()
 }
 
 /// Accepts only a YouTube/Google Netscape-format cookies file and makes sure it has the header
@@ -411,7 +413,8 @@ pub fn prepare_cookies() {
             let _ = fs::write(&path, clean);
         }
         Ok(_) => {}
-        Err(_) => {
+        Err(e) => {
+            store::log_error(&format!("Ignoring invalid cookies.txt: {e}"));
             let _ = fs::rename(&path, path.with_extension("txt.invalid"));
         }
     }
@@ -475,22 +478,67 @@ fn finish_cookies(staged: StagedCookies) {
 
 // ----------------------------------------------------------------- strategies
 
+fn browser_profile_available(browser: &str) -> bool {
+    // Avoid invoking yt-dlp for browsers that are not installed or have no default profile.
+    // This keeps expected "cookie database not found" noise out of the logs. DPAPI may still
+    // reject a present Chromium profile; users can always import an exported cookies.txt instead.
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    match browser.to_ascii_lowercase().as_str() {
+        "chrome" => {
+            if let Some(root) = local { candidates.push(root.join("Google/Chrome/User Data")); }
+        }
+        "edge" => {
+            if let Some(root) = local { candidates.push(root.join("Microsoft/Edge/User Data")); }
+        }
+        "brave" => {
+            if let Some(root) = local { candidates.push(root.join("BraveSoftware/Brave-Browser/User Data")); }
+        }
+        "firefox" => {
+            if let Some(root) = roaming { candidates.push(root.join("Mozilla/Firefox/profiles.ini")); }
+            if let Some(root) = local {
+                candidates.push(root.join("Packages/Mozilla.Firefox_n80bbvh6b1yt2/LocalCache/Roaming/Mozilla/Firefox/Profiles"));
+            }
+        }
+        _ => return false,
+    }
+    candidates.iter().any(|path| path.exists())
+}
+
 fn plan() -> Vec<Strategy> {
     let mut order = vec![Strategy::Default];
-    order.extend(CLIENT_FALLBACKS.into_iter().map(Strategy::Client));
-    if find_cookie_file().is_some() {
+    // An explicitly imported Netscape cookie file is the most reliable authenticated fallback.
+    // Try it before alternate anonymous clients, so bot-check errors do not waste several attempts
+    // before using the user's signed-in session.
+    let has_cookie_file = find_cookie_file().is_some();
+    if has_cookie_file {
         order.push(Strategy::CookieFile);
     }
-    if !COOKIES_BROWSER.is_empty() {
-        order.push(Strategy::Browser(COOKIES_BROWSER));
-    } else {
-        let cooling = MEMORY
-            .lock()
-            .unwrap()
-            .browsers_failed_at
-            .map_or(false, |t| t.elapsed() < AUTO_COOKIE_COOLDOWN);
-        if !cooling {
-            order.extend(AUTO_COOKIE_BROWSERS.into_iter().map(Strategy::Browser));
+    order.extend(CLIENT_FALLBACKS.into_iter().map(Strategy::Client));
+
+    // If the user explicitly imported a cookie file, prefer that predictable path over trying to
+    // decrypt every browser database. On current Windows Chromium builds, automatic extraction may
+    // fail with DPAPI/app-bound encryption; the UI gives the user a safe manual-import path instead.
+    if !has_cookie_file {
+        if !COOKIES_BROWSER.is_empty() {
+            if browser_profile_available(COOKIES_BROWSER) {
+                order.push(Strategy::Browser(COOKIES_BROWSER));
+            }
+        } else {
+            let cooling = MEMORY
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .browsers_failed_at
+                .map_or(false, |t| t.elapsed() < AUTO_COOKIE_COOLDOWN);
+            if !cooling {
+                order.extend(
+                    AUTO_COOKIE_BROWSERS
+                        .into_iter()
+                        .filter(|browser| browser_profile_available(browser))
+                        .map(Strategy::Browser),
+                );
+            }
         }
     }
     order
@@ -522,6 +570,7 @@ async fn run_smart(
     total_secs: u64,
     req: Option<u64>,
     avoid: Option<Strategy>,
+    rejected: &[Strategy],
 ) -> Result<(Output, Option<Strategy>), String> {
     let cache = cache_dir().to_string_lossy().into_owned();
     let build = |extra: &[String]| -> Vec<String> {
@@ -542,15 +591,20 @@ async fn run_smart(
         }
     }
     if let Some(i) = remembered
-        .filter(|g| Some(*g) != avoid)
+        .filter(|g| Some(*g) != avoid && !rejected.contains(g))
         .and_then(|g| order.iter().position(|s| *s == g))
     {
         let first = order.remove(i);
         order.insert(0, first);
     }
-    if let Some(i) = avoid.and_then(|a| order.iter().position(|s| *s == a)) {
-        let last = order.remove(i);
-        order.push(last);
+    // A stream URL can look valid to yt-dlp but be rejected by googlevideo on first request.
+    // Keep each such strategy at the end for this lookup, rather than cycling between the same
+    // rejected strategy and the latest remembered strategy.
+    for strategy in rejected.iter().copied().chain(avoid.into_iter()) {
+        if let Some(i) = order.iter().position(|s| *s == strategy) {
+            let last = order.remove(i);
+            order.push(last);
+        }
     }
 
     let deadline = Instant::now() + Duration::from_secs(total_secs);
@@ -686,7 +740,7 @@ pub async fn fetch_playlist(req: u64, url: String) -> PlaylistResult {
         "--print",
         "%(id)s|%(duration)s|%(title)s",
     ];
-    match run_smart(&head, &url, PLAYLIST_ATTEMPT_SECS, PLAYLIST_TOTAL_SECS, None, None).await {
+    match run_smart(&head, &url, PLAYLIST_ATTEMPT_SECS, PLAYLIST_TOTAL_SECS, None, None, &[]).await {
         Ok((out, _)) => {
             let tracks = parse_tracks(&out.stdout);
             if tracks.is_empty() {
@@ -743,7 +797,7 @@ pub async fn fetch_stream(req: u64, video_id: String, retry: Option<bool>) -> St
     let mut error = String::new();
     let mut auth_blocked = false;
 
-    let avoid = if retry.unwrap_or(false) {
+    let initial_avoid = if retry.unwrap_or(false) {
         last_stream()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -766,13 +820,70 @@ pub async fn fetch_stream(req: u64, video_id: String, retry: Option<bool>) -> St
                 "--dump-single-json",
             ];
             let page = format!("https://www.youtube.com/watch?v={video_id}");
-            match run_smart(&head, &page, STREAM_ATTEMPT_SECS, STREAM_TOTAL_SECS, Some(req), avoid).await {
-                Ok((out, used)) => {
-                    match parse_stream_metadata(&out.stdout) {
-                        Ok((upstream_url, headers)) => match media_proxy::register(upstream_url, headers) {
-                            Ok(local_url) => {
-                                url = local_url;
-                                if let Some(strategy) = used {
+            let deadline = Instant::now() + Duration::from_secs(STREAM_TOTAL_SECS);
+            let mut rejected: Vec<Strategy> = Vec::new();
+            let mut avoid = initial_avoid;
+
+            loop {
+                if req != STREAM_REQ.load(Ordering::SeqCst) {
+                    error = SUPERSEDED.to_string();
+                    break;
+                }
+                let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+                if left < 5 {
+                    if error.is_empty() {
+                        error = "Stream lookup timed out while trying alternate YouTube clients".into();
+                    }
+                    break;
+                }
+
+                match run_smart(
+                    &head,
+                    &page,
+                    STREAM_ATTEMPT_SECS,
+                    left,
+                    Some(req),
+                    avoid,
+                    &rejected,
+                ).await {
+                    Ok((out, used)) => {
+                        let strategy = match used {
+                            Some(strategy) => strategy,
+                            None => {
+                                auth_blocked = is_bot_error(&out.stderr);
+                                error = error_line(&out.stderr);
+                                if error.is_empty() {
+                                    error = "yt-dlp could not resolve a playable audio stream".into();
+                                }
+                                break;
+                            }
+                        };
+
+                        let (upstream_url, headers) = match parse_stream_metadata(&out.stdout) {
+                            Ok(metadata) => metadata,
+                            Err(e) => {
+                                auth_blocked = is_bot_error(&out.stderr);
+                                let yt_error = error_line(&out.stderr);
+                                error = if !yt_error.is_empty() {
+                                    yt_error
+                                } else {
+                                    format!("Could not read yt-dlp stream metadata: {e}")
+                                };
+                                break;
+                            }
+                        };
+
+                        // Validate each candidate with a one-byte upstream Range request before
+                        // handing it to WebView2. This catches expired/403 URLs early and lets us
+                        // try another extraction client instead of making the UI reconnect forever.
+                        match media_proxy::validate(&upstream_url, &headers).await {
+                            Ok(()) if req != STREAM_REQ.load(Ordering::SeqCst) => {
+                                error = SUPERSEDED.to_string();
+                                break;
+                            }
+                            Ok(()) => match media_proxy::register(upstream_url, headers) {
+                                Ok(local_url) => {
+                                    url = local_url;
                                     let mut last = last_stream().lock().unwrap_or_else(|p| p.into_inner());
                                     last.insert(video_id.clone(), strategy);
                                     if last.len() > 256 {
@@ -780,27 +891,48 @@ pub async fn fetch_stream(req: u64, video_id: String, retry: Option<bool>) -> St
                                             last.remove(&key);
                                         }
                                     }
+                                    error.clear();
+                                    break;
                                 }
+                                Err(e) => {
+                                    error = e;
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                store::log_error(&format!("{strategy:?} produced a rejected stream for {video_id}: {e}"));
+                                error = e;
+                                if rejected.contains(&strategy) {
+                                    // Every remaining strategy was exhausted and yt-dlp returned
+                                    // a URL from one we already know the media server rejected.
+                                    break;
+                                }
+                                rejected.push(strategy);
+                                last_stream().lock().unwrap_or_else(|p| p.into_inner()).insert(video_id.clone(), strategy);
+                                avoid = Some(strategy);
                             }
-                            Err(e) => error = e,
-                        },
-                        Err(e) => {
-                            auth_blocked = is_bot_error(&out.stderr);
-                            error = format!("Could not read yt-dlp stream metadata: {e}");
                         }
                     }
+                    Err(e) => {
+                        error = e;
+                        break;
+                    }
                 }
-                Err(e) => error = e,
             }
         } else {
             error = SUPERSEDED.to_string(); // a newer track was requested while this one waited
         }
     }
 
+    if url.is_empty() && error.to_ascii_lowercase().contains("http 403") {
+        // Every candidate media URL was forbidden. Route this through the UI's slower auth/token
+        // recovery path instead of quickly treating it like an ordinary corrupt track.
+        auth_blocked = true;
+    }
     if !error.is_empty() && error != SUPERSEDED {
         store::log_error(&error);
     }
-    // tells "no internet" apart from "bad video" (skipped for abandoned lookups)
+    // Tells "no internet" apart from "bad video" (skipped for abandoned lookups).
     let offline = url.is_empty()
         && error != SUPERSEDED
         && req == STREAM_REQ.load(Ordering::SeqCst)
