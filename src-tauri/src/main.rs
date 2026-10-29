@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod media_proxy;
 mod presence;
 mod store;
 mod window;
@@ -67,6 +68,7 @@ fn main() {
             ytdlp::clear_cookies,
         ])
         .setup(|app| {
+            media_proxy::start().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             if let Some(main_window) = app.get_webview_window("main") {
                 window::apply_effects(&main_window);
             }

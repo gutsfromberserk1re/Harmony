@@ -5,6 +5,7 @@
 
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -21,7 +22,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::store;
+use crate::{media_proxy, store};
 
 /// Optional manual override: "firefox", "chrome", "edge", ... ("" = automatic).
 /// You can also place a cookies.txt (Netscape format) next to the app or in the data folder.
@@ -60,7 +61,7 @@ static COOKIE_COMMIT: Mutex<()> = Mutex::new(());
 static COOKIE_GEN: AtomicU64 = AtomicU64::new(0);
 static COOKIE_RUN: AtomicU64 = AtomicU64::new(0);
 /// The strategy that produced the URL we last handed out (and for which video).
-static LAST_STREAM: Mutex<Option<(String, Strategy)>> = Mutex::new(None);
+static LAST_STREAM: Mutex<HashMap<String, Strategy>> = Mutex::new(HashMap::new());
 
 /// Error text of a lookup that was abandoned because a newer one (another track) replaced it.
 const SUPERSEDED: &str = "superseded";
@@ -705,6 +706,28 @@ pub async fn fetch_playlist(req: u64, url: String) -> PlaylistResult {
 
 // ----------------------------------------------------------------- streams
 
+/// `-j` preserves the URL and the request headers associated with the selected format.
+/// The frontend cannot attach those headers itself; the local media relay uses both.
+fn parse_stream_metadata(stdout: &str) -> Result<(String, HashMap<String, String>), String> {
+    let info: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("yt-dlp returned invalid JSON: {e}"))?;
+    let url = info
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| "yt-dlp JSON did not include a direct media URL".to_string())?
+        .to_string();
+    let mut headers = HashMap::new();
+    if let Some(object) = info.get("http_headers").and_then(serde_json::Value::as_object) {
+        for (name, value) in object {
+            if let Some(value) = value.as_str() {
+                headers.insert(name.clone(), value.to_string());
+            }
+        }
+    }
+    Ok((url, headers))
+}
+
 /// `req` is the id of the newest *foreground* lookup. The background prefetch of the next track
 /// passes the id that is already current (it does not count up), so it can never cancel a track
 /// the user asked for, while the next foreground lookup cancels it. `retry` = the URL handed out
@@ -719,10 +742,9 @@ pub async fn fetch_stream(req: u64, video_id: String, retry: Option<bool>) -> St
     let avoid = if retry.unwrap_or(false) {
         LAST_STREAM
             .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|(id, _)| *id == video_id)
-            .map(|(_, s)| *s)
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&video_id)
+            .copied()
     } else {
         None
     };
@@ -737,17 +759,31 @@ pub async fn fetch_stream(req: u64, video_id: String, retry: Option<bool>) -> St
                 "--no-warnings",
                 "--socket-timeout",
                 "15",
-                "-g",
+                "--dump-single-json",
             ];
             let page = format!("https://www.youtube.com/watch?v={video_id}");
             match run_smart(&head, &page, STREAM_ATTEMPT_SECS, STREAM_TOTAL_SECS, Some(req), avoid).await {
                 Ok((out, used)) => {
-                    url = out.stdout.lines().next().unwrap_or("").trim().to_string();
-                    if url.is_empty() {
-                        auth_blocked = is_bot_error(&out.stderr);
-                        error = error_line(&out.stderr);
-                    } else if let Some(s) = used {
-                        *LAST_STREAM.lock().unwrap() = Some((video_id.clone(), s));
+                    match parse_stream_metadata(&out.stdout) {
+                        Ok((upstream_url, headers)) => match media_proxy::register(upstream_url, headers) {
+                            Ok(local_url) => {
+                                url = local_url;
+                                if let Some(strategy) = used {
+                                    let mut last = LAST_STREAM.lock().unwrap_or_else(|p| p.into_inner());
+                                    last.insert(video_id.clone(), strategy);
+                                    if last.len() > 256 {
+                                        if let Some(key) = last.keys().next().cloned() {
+                                            last.remove(&key);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => error = e,
+                        },
+                        Err(e) => {
+                            auth_blocked = is_bot_error(&out.stderr);
+                            error = format!("Could not read yt-dlp stream metadata: {e}");
+                        }
                     }
                 }
                 Err(e) => error = e,

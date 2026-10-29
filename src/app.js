@@ -645,7 +645,17 @@
     if (el) adoptPreloaded(el);
     else audio.src = url;
     updateDuration();
-    audio.play().catch(() => {});
+    audio.play().catch((err) => {
+      const reason = `${err?.name || 'PlaybackError'}: ${err?.message || String(err)}`;
+      P.lastError = `audio.play() rejected - ${reason}`;
+      console.warn('[Harmony] audio.play() rejected', {
+        trackId: P.queue[P.currentIndex]?.id,
+        reason,
+        mediaErrorCode: audio.error?.code ?? null,
+        readyState: audio.readyState,
+        networkState: audio.networkState,
+      });
+    });
     refreshPresence();
   }
 
@@ -939,6 +949,22 @@
 
   function onPlayerError() {
     if (P.resolving || !audio.getAttribute('src')) return;
+    const mediaError = audio.error;
+    const labels = {
+      1: 'playback aborted',
+      2: 'network error',
+      3: 'audio decode error',
+      4: 'unsupported media source',
+    };
+    const code = mediaError?.code ?? 0;
+    const detail = `WebView media error ${code}${labels[code] ? ` (${labels[code]})` : ''}`;
+    P.lastError = mediaError?.message ? `${detail}: ${mediaError.message}` : detail;
+    console.warn('[Harmony] media element failed', {
+      trackId: P.queue[P.currentIndex]?.id,
+      detail: P.lastError,
+      readyState: audio.readyState,
+      networkState: audio.networkState,
+    });
     recover();
   }
 
