@@ -5,7 +5,7 @@
 Remake of the original python software
 
 <p align="center">
-  <a href="https://github.com/gutsfromberserk1re/Harmony/actions/runs/39566500291/artifacts/12330523400">
+  <a href="https://github.com/gutsfromberserk1re/Harmony/releases/download/2.2/Harmony-installer.zip">
     <img src="https://img.shields.io/badge/⬇%20Download-Harmony%20for%20Windows-7C83FD?style=for-the-badge&logo=windows&logoColor=white" alt="Download Harmony for Windows">
   </a>
   <a href="https://github.com/gutsfromberserk1re/hamonyr">
