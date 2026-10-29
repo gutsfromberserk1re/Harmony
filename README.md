@@ -98,3 +98,7 @@ See the repository for license information.
 <p align="center">
   <strong>Harmony</strong>
 </p>
+
+## Playback reliability notes
+
+Playback uses a small loopback-only HTTP relay between WebView2 and the upstream media URL. The relay preserves yt-dlp's selected-format request headers and forwards HTTP byte-range requests, which helps avoid media URLs that fail when opened directly by the browser and keeps seeking functional. Playback errors are also logged in the WebView console with media error codes, and retry strategy history is tracked per video so prefetching another track cannot overwrite it.
