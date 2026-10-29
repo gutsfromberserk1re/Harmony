@@ -44,22 +44,6 @@ Remake of the original python software
 
 
 
------
-## 📥 Download & Install
-
-### Recommended: Prebuilt installer
-
-<a href="https://github.com/gutsfromberserk1re/hamonyr/releases/download/1.0.0/Harmony-installer.zip">
-  <img src="https://img.shields.io/badge/Download%20Harmony-Get%20the%20Windows%20Installer-7C83FD?style=for-the-badge&logo=windows&logoColor=white" alt="Download the Harmony Windows installer">
-</a>
-
-1. Download the installer ZIP using the button above.
-2. Extract the ZIP archive.
-3. Run the included installer.
-4. Launch Harmony from your Start Menu or Desktop shortcut.
-
-The installer is designed to install per-user, without requiring administrator privileges. It includes yt-dlp and a WebView2 runtime bootstrapper.
-
 
 
 
