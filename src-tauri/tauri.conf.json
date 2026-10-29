@@ -30,19 +30,31 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "publisher": "Kiyo Kumo Ltd.",
     "shortDescription": "Harmony - YouTube playlist audio player",
-    "icon": ["icons/icon.ico"],
-    "externalBin": ["binaries/yt-dlp", "binaries/deno"],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/yt-dlp",
+      "binaries/deno"
+    ],
     "windows": {
-      "webviewInstallMode": { "type": "embedBootstrapper" },
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
       "nsis": {
         "installMode": "currentUser",
         "installerHooks": "installer-hooks.nsh",
         "startMenuFolder": "Harmony",
         "displayLanguageSelector": false
       }
+    },
+    "resources": {
+      "resources/": ""
     }
   }
 }

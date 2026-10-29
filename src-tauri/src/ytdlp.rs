@@ -30,7 +30,7 @@ const COOKIES_BROWSER: &str = "";
 /// If YouTube shows its bot check, these browsers are tried in order for a signed-in session.
 const AUTO_COOKIE_BROWSERS: [&str; 4] = ["firefox", "chrome", "edge", "brave"];
 /// YouTube app "clients" that often work without a sign-in. Which ones do changes over time.
-const CLIENT_FALLBACKS: [&str; 3] = ["android_vr", "tv", "web_safari"];
+const CLIENT_FALLBACKS: [&str; 4] = ["mweb", "android_vr", "tv", "web_safari"];
 const AUTO_COOKIE_COOLDOWN: Duration = Duration::from_secs(600);
 const UPDATE_INTERVAL: Duration = Duration::from_secs(12 * 3600);
 /// After a failed self-update, wait this long before trying again (instead of on every launch).
@@ -76,6 +76,7 @@ const SUPERSEDED: &str = "superseded";
 enum Strategy {
     Default,
     Client(&'static str),
+    ClientCookieFile(&'static str),
     CookieFile,
     Browser(&'static str),
 }
@@ -140,6 +141,13 @@ fn exe() -> &'static PathBuf {
             bundled.unwrap_or_else(|| PathBuf::from("yt-dlp"))
         }
     })
+}
+
+/// The standalone yt-dlp plugin directory adjacent to the executable it actually runs.
+/// yt-dlp supports ZIP plugin packages in this directory, which keeps Harmony's provider
+/// isolated from other yt-dlp installations on the machine.
+pub fn plugin_dir() -> PathBuf {
+    exe().parent().unwrap_or_else(|| Path::new(".")).join("yt-dlp-plugins")
 }
 
 fn command_for(program: &Path, args: &[String]) -> Command {
@@ -509,17 +517,17 @@ fn browser_profile_available(browser: &str) -> bool {
 fn plan() -> Vec<Strategy> {
     let mut order = vec![Strategy::Default];
     // An explicitly imported Netscape cookie file is the most reliable authenticated fallback.
-    // Try it before alternate anonymous clients, so bot-check errors do not waste several attempts
-    // before using the user's signed-in session.
+    // Try it before anonymous client fallbacks, then use the same signed-in session with mweb,
+    // which can obtain a video-bound PO token from the bundled provider.
     let has_cookie_file = find_cookie_file().is_some();
     if has_cookie_file {
         order.push(Strategy::CookieFile);
+        order.push(Strategy::ClientCookieFile("mweb"));
     }
     order.extend(CLIENT_FALLBACKS.into_iter().map(Strategy::Client));
 
     // If the user explicitly imported a cookie file, prefer that predictable path over trying to
-    // decrypt every browser database. On current Windows Chromium builds, automatic extraction may
-    // fail with DPAPI/app-bound encryption; the UI gives the user a safe manual-import path instead.
+    // decrypt browser databases. Current Chromium builds may reject automatic DPAPI extraction.
     if !has_cookie_file {
         if !COOKIES_BROWSER.is_empty() {
             if browser_profile_available(COOKIES_BROWSER) {
@@ -551,6 +559,17 @@ fn strategy_args(strategy: Strategy, cookies: Option<&StagedCookies>) -> Vec<Str
             "--extractor-args".into(),
             format!("youtube:player_client={c}"),
         ],
+        Strategy::ClientCookieFile(c) => {
+            let mut args = vec![
+                "--extractor-args".into(),
+                format!("youtube:player_client={c}"),
+            ];
+            if let Some(cookie_file) = cookies {
+                args.push("--cookies".into());
+                args.push(cookie_file.path.to_string_lossy().into_owned());
+            }
+            args
+        }
         Strategy::CookieFile => cookies
             .map(|c| vec!["--cookies".into(), c.path.to_string_lossy().into_owned()])
             .unwrap_or_default(),
@@ -572,14 +591,33 @@ async fn run_smart(
     avoid: Option<Strategy>,
     rejected: &[Strategy],
 ) -> Result<(Output, Option<Strategy>), String> {
+    // The provider is started lazily during a YouTube lookup, not while Harmony is idle. It
+    // remains alive long enough to cache tokens and is stopped after an idle period.
+    if let Err(e) = crate::pot_provider::ensure_started().await {
+        store::log_error(&format!("PO Token provider unavailable; continuing with client fallbacks: {e}"));
+    }
+    let provider_args = crate::pot_provider::extractor_args();
     let cache = cache_dir().to_string_lossy().into_owned();
     let build = |extra: &[String]| -> Vec<String> {
-        ["--cache-dir".to_string(), cache.clone()]
-            .into_iter()
-            .chain(head.iter().map(|s| s.to_string()))
-            .chain(extra.iter().cloned())
-            .chain([url.to_string()])
-            .collect()
+        let mut effective_extra = extra.to_vec();
+        // Merge the provider option into an existing extractor-args value so yt-dlp receives a
+        // single, unambiguous option regardless of which client strategy is being attempted.
+        if let Some(provider_arg) = provider_args.as_ref() {
+            if let Some(index) = effective_extra.iter().position(|arg| arg == "--extractor-args") {
+                if let Some(value) = effective_extra.get_mut(index + 1) {
+                    value.push(';');
+                    value.push_str(provider_arg);
+                }
+            } else {
+                effective_extra.push("--extractor-args".into());
+                effective_extra.push(provider_arg.clone());
+            }
+        }
+        let mut args = vec!["--cache-dir".to_string(), cache.clone()];
+        args.extend(head.iter().map(|s| s.to_string()));
+        args.extend(effective_extra);
+        args.push(url.to_string());
+        args
     };
 
     let mut order = plan();
@@ -615,11 +653,13 @@ async fn run_smart(
         if left < 5 {
             break;
         }
-        let staged = if strategy == Strategy::CookieFile { stage_cookies() } else { None };
-        if strategy == Strategy::CookieFile && staged.is_none() {
+        let needs_cookies = matches!(strategy, Strategy::CookieFile | Strategy::ClientCookieFile(_));
+        let staged = if needs_cookies { stage_cookies() } else { None };
+        if needs_cookies && staged.is_none() {
             continue;
         }
         let extra = strategy_args(strategy, staged.as_ref());
+        crate::pot_provider::touch();
         let result = run(&build(&extra), attempt_secs.min(left), req).await;
         if let Some(s) = staged {
             finish_cookies(s);
@@ -633,6 +673,13 @@ async fn run_smart(
                 continue; // a timeout is not final: the next strategy may be quicker
             }
         };
+        // These lines reveal whether the bundled PO-token provider was actually used without
+        // logging the full signed media URL or any cookie material.
+        for line in out.stderr.lines().filter(|line| {
+            line.contains("PO Token Providers") || line.contains("[pot:bgutil")
+        }) {
+            store::log_error(&format!("yt-dlp: {}", line.trim()));
+        }
         if !out.stdout.trim().is_empty() {
             MEMORY.lock().unwrap().good = Some(strategy);
             return Ok((out, Some(strategy)));
@@ -818,6 +865,7 @@ pub async fn fetch_stream(req: u64, video_id: String, retry: Option<bool>) -> St
                 "--socket-timeout",
                 "15",
                 "--dump-single-json",
+                "--verbose",
             ];
             let page = format!("https://www.youtube.com/watch?v={video_id}");
             let deadline = Instant::now() + Duration::from_secs(STREAM_TOTAL_SECS);

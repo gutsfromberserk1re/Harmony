@@ -5,7 +5,7 @@
 Remake of the original python software
 
 <p align="center">
-  <a href="https://github.com/gutsfromberserk1re/Harmony/releases/download/2.2/Harmony-installer.zip">
+  <a href="https://github.com/gutsfromberserk1re/Harmony/actions/runs/39566500291/artifacts/12330523400">
     <img src="https://img.shields.io/badge/⬇%20Download-Harmony%20for%20Windows-7C83FD?style=for-the-badge&logo=windows&logoColor=white" alt="Download Harmony for Windows">
   </a>
   <a href="https://github.com/gutsfromberserk1re/hamonyr">
@@ -43,6 +43,22 @@ Remake of the original python software
 
 
 
+
+-----
+## 📥 Download & Install
+
+### Recommended: Prebuilt installer
+
+<a href="https://github.com/gutsfromberserk1re/hamonyr/releases/download/1.0.0/Harmony-installer.zip">
+  <img src="https://img.shields.io/badge/Download%20Harmony-Get%20the%20Windows%20Installer-7C83FD?style=for-the-badge&logo=windows&logoColor=white" alt="Download the Harmony Windows installer">
+</a>
+
+1. Download the installer ZIP using the button above.
+2. Extract the ZIP archive.
+3. Run the included installer.
+4. Launch Harmony from your Start Menu or Desktop shortcut.
+
+The installer is designed to install per-user, without requiring administrator privileges. It includes yt-dlp and a WebView2 runtime bootstrapper.
 
 
 
@@ -86,3 +102,16 @@ See the repository for license information.
 ## Playback reliability notes
 
 Playback uses a small loopback-only HTTP relay between WebView2 and the upstream media URL. The relay preserves yt-dlp's selected-format request headers and forwards HTTP byte-range requests, which helps avoid media URLs that fail when opened directly by the browser and keeps seeking functional. Playback errors are also logged in the WebView console with media error codes, and retry strategy history is tracked per video so prefetching another track cannot overwrite it.
+
+## Recent authentication/playback fix
+
+The stream lookup now prefers an imported `cookies.txt` before anonymous client fallbacks, skips attempts to read browser databases that are not present, and reports the actual yt-dlp rejection when YouTube asks for authentication. Before returning a media URL, Harmony sends a small byte-range probe using the same extracted headers; rejected URLs are retried through alternate extraction strategies. The relay continues to forward byte ranges for seeking.
+
+YouTube may require a fresh signed-in cookie export and, in some cases, a Proof-of-Origin token provider. Cookies are sensitive session credentials: never share your `cookies.txt` or paste its contents into an issue. This patch improves fallback behavior but cannot guarantee bypassing YouTube account/IP restrictions or all token enforcement.
+
+
+## YouTube 403 / Proof-of-Origin token support
+
+The Windows build fetches the version-matched `bgutil-ytdlp-pot-provider` plugin and server. Harmony installs the plugin next to its own yt-dlp executable and starts the provider server on loopback only when a YouTube extraction runs. The provider is stopped after three minutes without extraction activity. The `mweb` client is included as a fallback, with the imported cookies file tried for that client when available.
+
+The provider is a third-party component (GPL-3.0); its source and license are included as application resources in the Windows build. YouTube can still refuse playback for account/IP restrictions or other enforcement changes, so this improves PO-token handling but is not a guarantee that every track will work. Do not share `cookies.txt` or the provider's logs if they contain account/session information.

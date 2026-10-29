@@ -210,10 +210,27 @@ pub async fn validate(url: &str, headers: &HashMap<String, String>) -> Result<()
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_string))
         .unwrap_or_else(|| "unknown host".to_string());
-    store::log_error(&format!(
-        "media URL validation returned HTTP {} from {}",
-        status.as_u16(), host
-    ));
+    // A short upstream response fragment often distinguishes an expired URL from an explicit
+    // PO-token/signature rejection. Keep it bounded and never log the signed media URL itself.
+    let body_excerpt = match tokio::time::timeout(Duration::from_secs(1), response.text()).await {
+        Ok(Ok(body)) => body
+            .chars()
+            .filter(|c| !c.is_control() || *c == ' ')
+            .take(220)
+            .collect::<String>(),
+        _ => String::new(),
+    };
+    if body_excerpt.is_empty() {
+        store::log_error(&format!(
+            "media URL validation returned HTTP {} from {}",
+            status.as_u16(), host
+        ));
+    } else {
+        store::log_error(&format!(
+            "media URL validation returned HTTP {} from {}; upstream says: {}",
+            status.as_u16(), host, body_excerpt
+        ));
+    }
     Err(format!(
         "YouTube rejected this media URL (HTTP {}). Trying another stream source...",
         status.as_u16()

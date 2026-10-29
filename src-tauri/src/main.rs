@@ -2,6 +2,7 @@
 
 mod media_proxy;
 mod presence;
+mod pot_provider;
 mod store;
 mod window;
 mod ytdlp;
@@ -73,12 +74,22 @@ fn main() {
                 window::apply_effects(&main_window);
             }
             ytdlp::prepare_cookies();
+            match app.path().resource_dir() {
+                Ok(resource_dir) => {
+                    if let Err(e) = pot_provider::prepare(&resource_dir, &ytdlp::plugin_dir()) {
+                        store::log_error(&format!("PO Token provider preparation failed: {e}"));
+                    }
+                }
+                Err(e) => store::log_error(&format!("could not locate bundled resources for PO Token provider: {e}")),
+            }
+            tauri::async_runtime::spawn(pot_provider::monitor_idle());
             tauri::async_runtime::spawn(ytdlp::prepare_and_update());
             Ok(())
         })
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::CloseRequested { .. }) {
                 window.state::<AppState>().presence.stop();
+                pot_provider::stop();
             }
         })
         .run(tauri::generate_context!())
